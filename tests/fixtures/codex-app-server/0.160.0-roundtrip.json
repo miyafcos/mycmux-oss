@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "cliVersion": "0.160.0",
+  "success": true,
+  "toolItems": [],
+  "operationId": "operation-synthetic",
+  "threadId": "thread-synthetic",
+  "turnId": "turn-synthetic",
+  "requestId": "send:operation-synthetic",
+  "configuration": {
+    "requested": {
+      "cwd": "/example",
+      "ephemeral": true
+    },
+    "effective": {
+      "model": "observed-model"
+    }
+  },
+  "events": [
+    {
+      "at": "2020-01-01T00:00:00Z",
+      "direction": "send",
+      "id": "send:operation-synthetic",
+      "method": "turn/start",
+      "threadId": "thread-synthetic",
+      "turnId": null
+    },
+    {
+      "at": "2020-01-01T00:00:01Z",
+      "direction": "receive",
+      "id": "send:operation-synthetic",
+      "accepted": true,
+      "method": null
+    },
+    {
+      "at": "2020-01-01T00:00:02Z",
+      "direction": "receive",
+      "id": null,
+      "method": "turn/started",
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic",
+      "status": "inProgress"
+    },
+    {
+      "at": "2020-01-01T00:00:03Z",
+      "direction": "receive",
+      "id": null,
+      "method": "turn/completed",
+      "threadId": "thread-synthetic",
+      "turnId": "turn-synthetic",
+      "status": "completed"
+    }
+  ]
+}

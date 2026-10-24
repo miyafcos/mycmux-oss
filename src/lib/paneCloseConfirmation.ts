@@ -1,0 +1,74 @@
+import { confirm } from "./appConfirmation";
+import type { Pane } from "../types";
+import { usePaneMetadataStore } from "../stores/paneMetadataStore";
+import { collectLiveAgentTabs, collectPaneCloseVictims, paneCloseImpactMessage } from "./paneCloseImpact";
+import { agentCloseDialogOptions } from "./agentCloseDialog";
+import type { PaneCloseTarget } from "./paneClosePreflight";
+
+export interface PaneCloseConfirmOptions {
+  /** Preflight panes hold the selected tabs; distinguish selection from a whole container. */
+  targetKind?: PaneCloseTarget["kind"];
+  /** Shown in the body when a workspace is closed, so the target is unambiguous. */
+  workspaceName?: string;
+  /**
+   * Closing a window: how many other windows stay open. The two outcomes read
+   * nothing alike — closing the last window is quitting, and everything in it
+   * comes back next launch, while closing one of several ends the work in it
+   * for good — so the question has to say which one it is asking.
+   */
+  peerWindowCount?: number;
+}
+
+export async function confirmPaneClose(
+  panes: readonly Pane[],
+  scope: "tab" | "pane" | "workspace" | "window",
+  options: PaneCloseConfirmOptions = {},
+): Promise<boolean> {
+  const metadata = usePaneMetadataStore.getState().metadata;
+  const volatileMetadata = usePaneMetadataStore.getState().volatileMetadata;
+  const victims = collectPaneCloseVictims(panes, metadata, volatileMetadata);
+  const liveAgentTabs = scope === "pane" ? collectLiveAgentTabs(panes, metadata, volatileMetadata) : [];
+  // A pane holding nothing live closes unprompted, the way it always has.
+  // A workspace never did: it asked every time, and it keeps asking even when
+  // no tab looks busy, because the close takes every pane in it.
+  if (victims.length === 0 && (scope === "pane" || scope === "tab")) return true;
+
+  const body = scope === "tab"
+    ? `「${victims[0].label}」は稼働中です。このタブを閉じて終了しますか？`
+    : scope === "pane" && liveAgentTabs.length > 0
+    ? `実行中のエージェントのタブが ${liveAgentTabs.length} 個あります。対象のタブをまとめて閉じますか？`
+    : victims.length > 0
+      ? paneCloseImpactMessage(victims)
+    : "開いているタブは、まとめて終了します。";
+  const peers = options.peerWindowCount ?? 0;
+  const outcome = scope !== "window"
+    ? ""
+    : peers > 0
+      ? `\nこのウィンドウの中のものは、次に起動しても戻りません（他の ${peers} 個のウィンドウはそのまま動きます）。`
+      : "\n次に起動したときに、いまの状態から再開できます。";
+  const named = scope === "workspace" && options.workspaceName
+    ? `ワークスペース「${options.workspaceName}」\n${body}`
+    : `${body}${outcome}`;
+  const selectedCount = panes.reduce((count, pane) => count + pane.tabs.length, 0);
+  const behindCount = Math.max(0, selectedCount - 1);
+  const title = scope === "tab"
+    ? "このタブを閉じます"
+    : options.targetKind === "tabs"
+      ? `選択したタブ ${selectedCount} 個を閉じます`
+      : behindCount > 0
+        ? `このタブと裏のタブ ${behindCount} 個を閉じます`
+        : "このタブを閉じます";
+
+  return confirm(named, {
+    ...((scope === "pane" || scope === "tab")
+      ? agentCloseDialogOptions(title)
+      : {
+          title: scope === "window"
+            ? peers > 0 ? "このウィンドウを閉じます" : "mycmux を終了します"
+            : "このワークスペースを閉じます",
+          kind: "warning" as const,
+          okLabel: "閉じる",
+          cancelLabel: "やめる",
+        }),
+  }).catch(() => false);
+}

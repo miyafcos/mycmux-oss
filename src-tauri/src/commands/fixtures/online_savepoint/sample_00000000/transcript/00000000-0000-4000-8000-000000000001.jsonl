@@ -1,0 +1,1 @@
+{"type": "user", "sessionId": "00000000-0000-4000-8000-000000000001", "uuid": "synthetic-message-one", "timestamp": "2020-01-01T00:00:00Z", "message": {"role": "user", "content": "Review the sample command parser."}}

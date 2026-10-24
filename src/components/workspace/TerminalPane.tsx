@@ -1,0 +1,1170 @@
+import { closePaneOperation } from "../../lib/paneCloseOperation";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  type ComponentProps,
+  useMemo,
+  useRef,
+  useState,
+  type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
+  type MouseEvent as ReactMouseEvent,
+} from "react";
+import { open } from "@tauri-apps/plugin-shell";
+import { invoke } from "@tauri-apps/api/core";
+import ErrorBoundary from "../common/ErrorBoundary";
+import type { Pane, PaneTab } from "../../types";
+import { isDeclaredTab, isRestorableTab } from "../../lib/tabLifecycle";
+import { useRetainedViews } from "../../lib/retainedViews";
+import { hasTearoutSessionAttachment, useTearoutAttachmentRevision, isTearoutSessionDormant, startDormantTearoutSession, tearoutAttachmentGeneration } from "../../lib/tearout/sessionAttachment";
+import { recordPerf } from "../../lib/perfTimeline";
+import PaneTabBar from "./PaneTabBar";
+import { paneDndStrings } from "./paneDndStrings";
+import { terminalPaneStrings } from "./terminalPaneStrings";
+import XTermWrapper, { hasTerminalBuffer } from "../terminal/XTermWrapper";
+import BrowserPane from "./BrowserPane";
+import { displayedPaneShortcutSource } from "./webPaneShortcuts";
+import WebPaneStatusBar from "./WebPaneStatusBar";
+import LauncherPane from "./LauncherPane";
+import OnlinePanel from "../online/OnlinePanel";
+import {
+  useWorkspaceLayoutStore,
+  useUiStore,
+  usePaneMetadataStore
+} from "../../stores/workspaceStore";
+import { useWorkspaceListStore } from "../../stores/workspaceListStore";
+import { getAgent, getDefaultAgent } from "../../lib/agents";
+import { previewArtifactUriForSessionV2, type SaveEditableArtifactResult } from "../../lib/ipc";
+import { openPathWithDefaultApp, revealPathInExplorer } from "../../lib/ipc";
+import { isArtifactPreviewUri, isDirectoryLikeUri } from "../terminal/terminalLinkProvider";
+import { captureTemporaryFocusReturn, focusController, type FocusSource } from "../../lib/focusController";
+import { usePaneHoverFocus } from "../../hooks/usePaneHoverFocus";
+import { useDismissOnOutside } from "../../hooks/useDismissOnOutside";
+import { usePaneDragStore } from "../../stores/paneDragStore";
+import { useDetachedDockStore } from "../../stores/detachedDockStore";
+import { useSavepointDragStore } from "../../stores/savepointDragStore";
+import { resolveLiveSavepointTargetKind, savepointTargetLabel } from "../../lib/savepointHandoff";
+import { resolvePaneHandoffEligibility } from "../../lib/paneHandoff";
+import { onlineStrings } from "../online/onlineStrings";
+import { useSettingsStore } from "../../stores/settingsStore";
+import { PaneComposer } from "../composer/PaneComposer";
+import { isStartupSessionPending, subscribeStartupSessionGate } from "../../lib/startupSessionGate";
+import { buildTerminalPaneLaunch } from "../../lib/terminalPaneLaunch";
+export { buildLaunchArgs } from "../../lib/terminalLaunchArgs";
+
+interface TerminalPaneProps {
+  pane: Pane;
+  workspaceId: string;
+  onClose?: () => void;
+  onSplitRight?: () => void;
+  onSplitDown?: () => void;
+  retainedTabLimit?: number;
+}
+
+function isTerminalTab(tab: PaneTab | undefined): tab is PaneTab {
+  return Boolean(tab && (tab.type === undefined || tab.type === "terminal"));
+}
+
+function isPaneClickActivatableTab(tab: PaneTab | undefined): tab is PaneTab {
+  return Boolean(tab && (tab.type === undefined || tab.type === "terminal"
+    || tab.type === "browser" || tab.type === "web" || tab.type === "online"));
+}
+
+/**
+ * OSC 9988 payload normalization: convert "file:///C:/..." or "/C:/..." into a
+ * raw absolute path that convertFileSrc() expects (e.g. "C:/Users/...").
+ * Handles Windows drive letters and POSIX paths uniformly, and collapses
+ * backslashes to "/" so the same file yields one canonical string (stable dedup).
+ */
+function normalizeHtmlPath(payload: string): string {
+  let p = payload.trim();
+  if (p.startsWith("file://")) {
+    p = p.slice(7);
+    // Windows: leading "/C:/..." → strip the slash; POSIX: keep "/Users/...".
+    if (/^\/[A-Za-z]:/.test(p)) {
+      p = p.slice(1);
+    }
+  }
+  try {
+    p = decodeURIComponent(p);
+  } catch {
+    // payload was not URL-encoded; leave as-is
+  }
+  return p.replace(/\\/g, "/");
+}
+
+/**
+ * Security gate for OSC 9988. The terminal emits arbitrary bytes, so the payload
+ * path is fully untrusted — any program writing to the pane could forge the
+ * escape with a path to credentials or any other local file, and assetProtocol
+ * scope is "**". The Rust backend injects exactly one canonical sidetab path per
+ * session (the active runtime directory's sessions/<sessionId>/out.html) and strips inbound overrides,
+ * so the only legitimate target is that file. Bind the rendered path to the
+ * pane's own (app-assigned) sessionId and the fixed leaf, rejecting everything
+ * else regardless of where $HOME lives. paneSessionId is trusted; the path is not.
+ */
+function isCanonicalSidetabPath(
+  normalizedPath: string,
+  paneSessionId: string,
+  testProfile: string | null | undefined,
+): boolean {
+  if (testProfile === undefined) return false;
+  if (!paneSessionId || /[\\/]/.test(paneSessionId) || paneSessionId.includes("..")) {
+    return false;
+  }
+  if (normalizedPath.includes("..")) {
+    return false;
+  }
+  const runtimeLeaf = testProfile ? `.mycmux-${testProfile}` : ".mycmux";
+  const expectedSuffix = `/${runtimeLeaf}/sessions/${paneSessionId}/out.html`;
+  // Path segments are backend-fixed lowercase + a lowercase-hex uuid; compare
+  // case-insensitively so Windows drive/home casing never yields a false reject.
+  return normalizedPath.toLowerCase().endsWith(expectedSuffix.toLowerCase());
+}
+
+function isLocalArtifactLink(uri: string): boolean {
+  const trimmed = uri.trim();
+  return (
+    /^file:\/\//i.test(trimmed)
+    || /^[A-Za-z]:[\\/]/.test(trimmed)
+    // MSYS / Git-Bash absolute form: `/c/Users/...` (single-letter drive).
+    || /^\/[A-Za-z]\//.test(trimmed)
+  );
+}
+
+function truncatePaneActionError(message: string, max = 96): string {
+  if (message.length <= max) return message;
+  return `${message.slice(0, max - 3)}...`;
+}
+
+const PANE_CLICK_ACTIVATE_MAX_DISTANCE_PX = 5;
+/** Below this the pane is too short to spend two lines on an input box. */
+const COMPOSER_MIN_PANE_HEIGHT = 200;
+/** Hysteresis, so a pane resting on the boundary cannot flicker the composer. */
+const COMPOSER_RESTORE_PANE_HEIGHT = 224;
+
+type PaneActivationOptions = {
+  focusTerminal?: boolean;
+  source?: FocusSource;
+  focusGuard?: () => boolean;
+  commitHoverSelection?: (commit: () => void) => void;
+  onHoverFocusAborted?: () => void;
+};
+
+type PendingPaneClickActivation = {
+  sessionId: string;
+  pointerId: number;
+  button: number;
+  focusTerminal: boolean;
+  x: number;
+  y: number;
+  selectionText: string;
+};
+
+type ArtifactLinkPopoverState = {
+  uri: string;
+  x: number;
+  y: number;
+};
+
+export const PANE_CLICK_IGNORED_TARGET_SELECTOR = [
+  "button",
+  "a",
+  "input",
+  "textarea",
+  "select",
+  "iframe",
+  "[contenteditable='true']",
+  ".pane-tabbar",
+  "[data-pane-focus-pane-id]",
+  ".pane-tab-pill",
+  ".pane-action-btn",
+  "[data-pane-drag-handle]",
+  // The composer's padding and badge are part of the input, not the terminal:
+  // hitting them must not hand the keyboard back to xterm mid-tap.
+  "[data-composer-session]",
+  "[data-terminal-transcript-panel]",
+].join(",");
+
+function shouldIgnorePaneClickActivationTarget(target: EventTarget | null, focusTerminal = true, button = 0): boolean {
+  if (!focusTerminal) {
+    if (!(target instanceof Element)) return true;
+    // The heading name and rename dialog have their own selection logic.
+    // Blank heading space follows the same completed gesture as pane content.
+    if (target.closest("iframe,embed,.pane-tab-pill,.pane-tabbar[role='dialog'],.pane-header-close,.pane-place-close,[data-pane-drag-handle],[data-composer-session],[data-terminal-transcript-panel]")) return true;
+    if (button !== 0 && target.closest(".pane-tabbar")) return true;
+    return button !== 0 && Boolean(target.closest("button,a,input,textarea,select,[contenteditable='true']"));
+  }
+  if (target instanceof Element && target.closest(".xterm-helper-textarea")) {
+    return false;
+  }
+  return target instanceof Element
+    ? Boolean(target.closest(PANE_CLICK_IGNORED_TARGET_SELECTOR))
+    : true;
+}
+
+function getDocumentSelectionText(): string {
+  const selection = window.getSelection?.();
+  return selection?.toString().trim() ?? "";
+}
+
+function useTerminalPaneLaunch(pane: Pane, activeTab: PaneTab | undefined) {
+  return useMemo(
+    () => buildTerminalPaneLaunch(pane, activeTab, { getAgent, getDefaultAgent }),
+    [activeTab, pane.cwd, pane.launchEnv],
+  );
+}
+
+type RetainedTerminalSessionProps = Pick<ComponentProps<typeof XTermWrapper>,
+  "workspaceId" | "onZoomToggle" | "onUrlClick" | "onArtifactLinkClick"> & {
+  pane: Pane;
+  tab: PaneTab;
+  visible: boolean;
+  historyVisible: boolean;
+};
+
+const RetainedTerminalSession = memo(function RetainedTerminalSession({
+  pane, tab, visible, historyVisible, workspaceId, onZoomToggle, onUrlClick, onArtifactLinkClick,
+}: RetainedTerminalSessionProps) {
+  const { paneCwd, resolvedAgentId, agent, savedAgentSession, launchCommand, launchArgs, launchEnv, restoreReason } = useTerminalPaneLaunch(pane, tab);
+  const agentKind = usePaneMetadataStore(state => state.metadata[tab.sessionId]?.agentKind);
+  if (!agent) return null;
+  return (
+    <div data-retained-terminal={tab.sessionId} data-session-id={tab.sessionId} aria-hidden={!visible}
+      style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column",
+        visibility: visible ? "inherit" : "hidden", pointerEvents: visible ? "inherit" : "none" }}>
+      <ErrorBoundary>
+        <XTermWrapper
+          workspaceId={workspaceId} sessionId={tab.sessionId} historyVisible={historyVisible}
+          command={launchCommand} args={launchArgs} agentId={resolvedAgentId}
+          agentKind={savedAgentSession?.kind ?? tab.agentKind ?? agentKind}
+          onZoomToggle={onZoomToggle} onUrlClick={onUrlClick} onArtifactLinkClick={onArtifactLinkClick}
+          cwd={paneCwd} initialReplay={tab.terminalSnapshot} launchEnv={launchEnv}
+          restoreReason={restoreReason}
+        />
+      </ErrorBoundary>
+    </div>
+  );
+});
+
+export default memo(function TerminalPane({ pane, workspaceId, onClose, onSplitRight, onSplitDown, retainedTabLimit = 2 }: TerminalPaneProps) {
+  const [testProfile, setTestProfile] = useState<string | null | undefined>(undefined);
+  useEffect(() => {
+    void invoke<string | null>("get_test_profile").then(setTestProfile).catch(() => setTestProfile(undefined));
+  }, []);
+  // Derived boolean selectors only re-render when THIS pane's state actually changes.
+  // isActive checks against any of this pane's tab sessionIds so the border
+  // follows the session that is actually receiving input, not mouse selection.
+  const isActive = useUiStore((s) => s.activePaneId !== null && (
+    s.activePaneId === pane.sessionId || pane.tabs.some(tab => tab.sessionId === s.activePaneId)
+  ));
+  const zoomedPaneId = useUiStore((s) => s.zoomedPaneId);
+  const isZoomed = zoomedPaneId === pane.id;
+  const setZoomedPaneId = useUiStore((s) => s.setZoomedPaneId);
+  const activeWorkspaceId = useWorkspaceListStore((s) => s.activeWorkspaceId);
+  const isPaneVisible = activeWorkspaceId === workspaceId
+    && (zoomedPaneId === null || isZoomed);
+  const dragItem = usePaneDragStore((s) => s.item);
+  const handoffDropTarget = usePaneDragStore((s) =>
+    s.target?.kind === "handoff"
+      && s.target.workspaceId === workspaceId
+      && s.target.paneId === pane.id
+      ? s.target
+      : null,
+  );
+  const detachedHandoffTarget = useDetachedDockStore(state => state.target?.kind === "handoff"
+    && state.target.workspaceId === workspaceId && state.target.paneId === pane.id ? state.target : null);
+  const savepointDropTarget = useSavepointDragStore((state) =>
+    state.target?.mode !== "export"
+      && state.target?.workspaceId === workspaceId
+      && state.target.paneId === pane.id
+      ? state.target
+      : null,
+  );
+  const savepointDragItem = useSavepointDragStore((state) => state.item);
+  const activeTab = pane.tabs.find((t) => t.id === pane.activeTabId) ?? pane.tabs[0];
+  const [startupSessionPending, setStartupSessionPending] = useState(() =>
+    activeTab ? isStartupSessionPending(activeTab.sessionId) : false,
+  );
+  useEffect(() => {
+    const update = () => setStartupSessionPending(
+      activeTab ? isStartupSessionPending(activeTab.sessionId) : false,
+    );
+    update();
+    return subscribeStartupSessionGate(update);
+  }, [activeTab?.sessionId]);
+  const activeTabMetadata = usePaneMetadataStore((s) =>
+    activeTab ? s.metadata[activeTab.sessionId] : undefined,
+  );
+  const activeTabVolatileMetadata = usePaneMetadataStore((s) =>
+    activeTab ? s.volatileMetadata[activeTab.sessionId] : undefined,
+  );
+  const activeTabMetadataAgentKind = activeTabMetadata?.agentKind;
+  const activeTabMetadataProcessTitle = activeTabVolatileMetadata?.processTitle;
+  const savepointPaneTargetKind = savepointDragItem
+    ? resolveLiveSavepointTargetKind(activeTab, activeTabMetadataAgentKind)
+    : null;
+  const dragSourceTab = useWorkspaceListStore((state) => {
+    if (!dragItem) return undefined;
+    const sourceWorkspace = state.workspaces.find((workspace) => workspace.id === dragItem.workspaceId);
+    const sourcePane = sourceWorkspace?.panes.find((candidate) => candidate.id === dragItem.paneId);
+    if (!sourcePane) return undefined;
+    return dragItem.kind === "tab"
+      ? sourcePane.tabs.find((tab) => tab.id === dragItem.tabId)
+      : (sourcePane.tabs.find((tab) => tab.id === sourcePane.activeTabId) ?? sourcePane.tabs[0]);
+  });
+  const dragSourceMetadata = usePaneMetadataStore((state) =>
+    dragSourceTab ? state.metadata[dragSourceTab.sessionId] : undefined,
+  );
+  const paneHandoffEligibility = dragItem
+    ? resolvePaneHandoffEligibility(
+        {
+          workspaceId: dragItem.workspaceId,
+          paneId: dragItem.paneId,
+          tab: dragSourceTab,
+          metadata: dragSourceMetadata,
+        },
+        {
+          workspaceId,
+          paneId: pane.id,
+          tab: activeTab,
+          metadata: activeTabMetadata,
+        },
+      )
+    : null;
+  const paneRootRef = useRef<HTMLDivElement>(null);
+  const hoverContentRef = useRef<HTMLDivElement>(null);
+  // A composer costs the pane two lines, which is a bad trade once the pane is
+  // short enough that the terminal itself is the scarce thing.
+  const composerEnabled = useSettingsStore((state) => state.paneComposerEnabled);
+  const [paneIsTall, setPaneIsTall] = useState(true);
+  const showComposer = composerEnabled && paneIsTall;
+  const pendingPaneClickActivationRef = useRef<PendingPaneClickActivation | null>(null);
+  const cancelNonTerminalClick = useCallback((): void => {
+    if (pendingPaneClickActivationRef.current?.focusTerminal === false) pendingPaneClickActivationRef.current = null;
+  }, []);
+  const pendingPreviewUriRef = useRef<string | null>(null);
+  const artifactLinkPopoverRef = useRef<HTMLDivElement>(null);
+  const artifactFocusReturnRef = useRef<ReturnType<typeof captureTemporaryFocusReturn> | null>(null);
+  useEffect(() => () => artifactFocusReturnRef.current?.cancel(), []);
+  const [previewActionError, setPreviewActionError] = useState<string | null>(null);
+  const [artifactLinkPopover, setArtifactLinkPopover] = useState<ArtifactLinkPopoverState | null>(null);
+
+  // Granular metadata selectors only re-render when notification/done count changes.
+  const notificationCount = usePaneMetadataStore((s) =>
+    pane.tabs.reduce(
+      (sum, tab) =>
+        sum + (s.metadata[tab.sessionId]?.notificationCount ?? 0),
+      0,
+    ),
+  );
+
+  const clearNotification = usePaneMetadataStore((s) => s.clearNotification);
+
+  const addTabToPane = useWorkspaceLayoutStore((s) => s.addTabToPane);
+  const setActivePaneTab = useWorkspaceLayoutStore((s) => s.setActivePaneTab);
+  const openOrReloadHtmlPreviewPane = useWorkspaceLayoutStore((s) => s.openOrReloadHtmlPreviewPane);
+  const setBrowserTabDirty = useWorkspaceLayoutStore((s) => s.setBrowserTabDirty);
+  const refreshBrowserTabPreview = useWorkspaceLayoutStore((s) => s.refreshBrowserTabPreview);
+
+  // OSC 9988 from XTermWrapper. Match by pane.tabs membership (not activeTab)
+  useEffect(() => {
+    const root = paneRootRef.current;
+    if (!root || !composerEnabled) return;
+    const observer = new ResizeObserver(([entry]) => {
+      const height = entry?.contentRect.height ?? 0;
+      setPaneIsTall((wasTall) => (wasTall
+        ? height >= COMPOSER_MIN_PANE_HEIGHT
+        : height >= COMPOSER_RESTORE_PANE_HEIGHT));
+    });
+    observer.observe(root);
+    return () => observer.disconnect();
+  }, [composerEnabled]);
+
+  // so reloads still fire after the browser tab is activated and the terminal
+  // sessionId is no longer activeTab.sessionId.
+  useEffect(() => {
+    const handler = (ev: Event) => {
+      const detail = (ev as CustomEvent).detail as
+        | { paneSessionId?: string; payload?: string }
+        | undefined;
+      if (!detail?.paneSessionId || !detail.payload) return;
+      if (!pane.tabs.some((t) => t.sessionId === detail.paneSessionId)) return;
+      const htmlPath = normalizeHtmlPath(detail.payload);
+      if (!htmlPath) return;
+      // Reject forged OSC payloads that point anywhere but this session's
+      // canonical sidetab file. Without this, terminal output could render
+      // arbitrary local files in the iframe (assetProtocol scope is "**").
+      if (!isCanonicalSidetabPath(htmlPath, detail.paneSessionId, testProfile)) {
+        return;
+      }
+      openOrReloadHtmlPreviewPane(workspaceId, pane.id, {
+        previewPath: htmlPath,
+        sourcePath: htmlPath,
+        sourceKind: "html",
+      });
+    };
+    window.addEventListener("mycmux:html-out", handler);
+    return () => window.removeEventListener("mycmux:html-out", handler);
+  }, [pane.tabs, pane.id, workspaceId, openOrReloadHtmlPreviewPane, testProfile]);
+
+  const hasNotification = notificationCount > 0;
+
+  useDismissOnOutside(
+    Boolean(artifactLinkPopover) || activeTab?.type === "browser" || activeTab?.type === "web" || activeTab?.type === "online"
+      || pendingPaneClickActivationRef.current?.focusTerminal === false,
+    artifactLinkPopover ? artifactLinkPopoverRef : paneRootRef,
+    (reason) => {
+      if (reason === "escape" || !artifactLinkPopover) cancelNonTerminalClick();
+      if (artifactLinkPopover) {
+        if (reason === "escape") artifactFocusReturnRef.current?.(artifactLinkPopoverRef.current);
+        artifactFocusReturnRef.current?.cancel(); artifactFocusReturnRef.current = null;
+        setArtifactLinkPopover(null);
+      }
+    },
+  );
+
+  // Two-state border: active (accent) or inactive (transparent).
+  // Notification border is handled by the CSS .has-notification class.
+  const borderColor = isZoomed
+    ? "transparent"
+    : isActive
+      ? "var(--cmux-accent, rgba(10, 132, 255, 0.7))"
+      : "transparent";
+  // Depth instead of a thicker line: a ring just inside the edge, and a soft
+  // spread outside it. The border itself stays 1px at every state so nothing
+  // steps as focus moves between panes.
+  const focusGlow = isActive && !isZoomed
+    ? "inset 0 0 0 1px color-mix(in srgb, var(--cmux-accent) 55%, transparent),"
+      + " 0 0 0 3px color-mix(in srgb, var(--cmux-accent) 12%, transparent)"
+    : "none";
+
+
+  const selectNonTerminalPane = useCallback(() => {
+    const ws = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+    const p = ws?.panes.find(candidate => candidate.id === pane.id);
+    const tab = p?.tabs.find(candidate => candidate.id === p.activeTabId) ?? p?.tabs[0];
+    if (!p || !tab || !(tab.type === "browser" || tab.type === "web" || tab.type === "online")
+      || !displayedPaneShortcutSource(tab.id)) return;
+    if (useUiStore.getState().activePaneId === tab.sessionId) useUiStore.getState().bumpFocusRevision();
+    useUiStore.getState().setActivePaneId(tab.sessionId);
+    for (const candidate of p.tabs) clearNotification(candidate.sessionId);
+  }, [workspaceId, pane.id, clearNotification]);
+
+  const activatePane = useCallback((options: PaneActivationOptions = {}) => {
+    const ws = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+    const p = ws?.panes.find((candidate) => candidate.id === pane.id);
+    const tab = p?.tabs.find((candidate) => candidate.id === p.activeTabId) ?? p?.tabs[0];
+    if (!p || !isPaneClickActivatableTab(tab)) return;
+    if (tab.type === "browser" || tab.type === "web" || tab.type === "online") {
+      if (options.source === "hover") { options.onHoverFocusAborted?.(); return; }
+      selectNonTerminalPane();
+      return;
+    }
+    // Even reselecting the active terminal is a newer user selection. Invalidate
+    // delayed heading work before scheduling this selection's terminal focus.
+    if (options.source !== "hover" && useUiStore.getState().activePaneId === tab.sessionId) useUiStore.getState().bumpFocusRevision();
+    focusController.request(options.source ?? "pointer", {
+      sessionId: tab.sessionId,
+      action: "commit",
+      focus: options.focusTerminal ?? true,
+      focusGuard: options.focusGuard,
+      ...(options.source === "hover" ? { onHoverFocusAborted: options.onHoverFocusAborted, commitHoverSelection: (commit: () => void) => {
+        if (options.commitHoverSelection) options.commitHoverSelection(commit);
+        else commit();
+        if (useUiStore.getState().activePaneId === tab.sessionId) {
+          for (const candidate of p.tabs) clearNotification(candidate.sessionId);
+        }
+      } } : {}),
+    });
+    if (options.source === "hover") return;
+    for (const candidate of p.tabs) {
+      clearNotification(candidate.sessionId);
+    }
+  }, [workspaceId, pane.id, clearNotification, selectNonTerminalPane]);
+
+  const activateFocusedPreview = useCallback((target: EventTarget | null): void => {
+    if (!(target instanceof HTMLIFrameElement || target instanceof HTMLEmbedElement) || !paneRootRef.current?.contains(target)) return;
+    const tabId = target.dataset.browserPaneTabId;
+    const tab = tabId ? displayedPaneShortcutSource(tabId) : undefined;
+    if (!tab || tab.type !== "browser") return;
+    if (useUiStore.getState().activePaneId === tab.sessionId) useUiStore.getState().bumpFocusRevision();
+    useUiStore.getState().setActivePaneId(tab.sessionId);
+  }, []);
+
+  useEffect(() => {
+    const onMove = (event: PointerEvent): void => {
+      const pending = pendingPaneClickActivationRef.current;
+      if (pending && !pending.focusTerminal && pending.pointerId === event.pointerId
+        && Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > PANE_CLICK_ACTIVATE_MAX_DISTANCE_PX) {
+        cancelNonTerminalClick();
+      }
+    };
+    const onEnd = (event: PointerEvent): void => {
+      if (pendingPaneClickActivationRef.current?.pointerId === event.pointerId) cancelNonTerminalClick();
+    };
+    // A drag can clear its store during Escape or handoff before pointer-up.
+    // Latch cancellation at movement/start, including events outside this root.
+    const unsubscribe = usePaneDragStore.subscribe(state => { if (state.item) cancelNonTerminalClick(); });
+    window.addEventListener("pointermove", onMove, true);
+    window.addEventListener("pointercancel", onEnd, true);
+    window.addEventListener("pointerup", onEnd);
+    window.addEventListener("blur", cancelNonTerminalClick);
+    return () => {
+      unsubscribe(); cancelNonTerminalClick();
+      window.removeEventListener("pointermove", onMove, true);
+      window.removeEventListener("pointercancel", onEnd, true);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("blur", cancelNonTerminalClick);
+    };
+  }, [cancelNonTerminalClick]);
+
+  // WKWebView can suppress listeners installed inside a sandboxed srcdoc.
+  // Observe iframe/PDF focus from the parent without taking focus from it.
+  useEffect(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const onWindowBlur = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      const revision = useUiStore.getState().focusRevision;
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (useUiStore.getState().focusRevision !== revision || !document.hasFocus()) return;
+        activateFocusedPreview(document.activeElement);
+      }, 0);
+    };
+    window.addEventListener("blur", onWindowBlur);
+    return () => {
+      window.removeEventListener("blur", onWindowBlur);
+      if (timer !== undefined) clearTimeout(timer);
+    };
+  }, [activateFocusedPreview]);
+
+  const handlePanePointerDownCapture = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const ws = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+    const p = ws?.panes.find((candidate) => candidate.id === pane.id);
+    const tab = p?.tabs.find((candidate) => candidate.id === p.activeTabId) ?? p?.tabs[0];
+    if (!p || !isPaneClickActivatableTab(tab)) {
+      pendingPaneClickActivationRef.current = null;
+      return;
+    }
+    const focusTerminal = tab.type === undefined || tab.type === "terminal";
+    const isSelectionButton = event.button === 0 || event.button === 2;
+    if (
+      !isSelectionButton ||
+      event.shiftKey ||
+      event.altKey ||
+      event.ctrlKey ||
+      event.metaKey ||
+      shouldIgnorePaneClickActivationTarget(event.target, focusTerminal, event.button)
+    ) {
+      pendingPaneClickActivationRef.current = null;
+      return;
+    }
+    if (focusTerminal) {
+      focusController.request("pointer", {
+        sessionId: tab.sessionId,
+        paneId: pane.id,
+        action: "pending",
+        pointerId: event.pointerId,
+        focus: true,
+      });
+      if (event.button === 2) {
+        pendingPaneClickActivationRef.current = null;
+        activatePane();
+        return;
+      }
+    }
+    pendingPaneClickActivationRef.current = {
+      sessionId: tab.sessionId,
+      pointerId: event.pointerId,
+      button: event.button,
+      focusTerminal,
+      x: event.clientX,
+      y: event.clientY,
+      selectionText: getDocumentSelectionText(),
+    };
+  }, [activatePane, workspaceId, pane.id]);
+
+  const handlePanePointerUpCapture = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    const pending = pendingPaneClickActivationRef.current;
+    pendingPaneClickActivationRef.current = null;
+    if (!pending || pending.pointerId !== event.pointerId || event.button !== pending.button) return;
+    const abortPendingActivation = (): void => {
+      if (pending.focusTerminal) {
+        focusController.request("pointer", { sessionId: pending.sessionId, action: "abort" });
+      }
+    };
+    if (event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) {
+      abortPendingActivation();
+      return;
+    }
+    if (shouldIgnorePaneClickActivationTarget(event.target, pending.focusTerminal, event.button)) {
+      abortPendingActivation();
+      return;
+    }
+    if (Math.hypot(event.clientX - pending.x, event.clientY - pending.y) > PANE_CLICK_ACTIVATE_MAX_DISTANCE_PX) {
+      abortPendingActivation();
+      return;
+    }
+    const nextSelectionText = getDocumentSelectionText();
+    if (nextSelectionText && nextSelectionText !== pending.selectionText) {
+      abortPendingActivation();
+      return;
+    }
+    activatePane();
+  }, [activatePane]);
+
+  const handlePanePointerCancelCapture = useCallback(() => {
+    const pending = pendingPaneClickActivationRef.current;
+    pendingPaneClickActivationRef.current = null;
+    if (pending?.focusTerminal) {
+      focusController.request("pointer", { sessionId: pending.sessionId, action: "abort" });
+    }
+  }, []);
+
+  const handlePaneClickCapture = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
+    // Keyboard activation has no pointer gesture. Mouse clicks retain the
+    // down/up guards, including rejected drags, modifiers and text selection.
+    if (event.detail !== 0 || event.button !== 0 || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey) return;
+    if (!(event.target instanceof Element) || !event.target.closest("button,a")
+      || shouldIgnorePaneClickActivationTarget(event.target, false)) return;
+    const current = useWorkspaceListStore.getState().getWorkspace(workspaceId)?.panes.find(candidate => candidate.id === pane.id);
+    const tab = current?.tabs.find(candidate => candidate.id === current.activeTabId) ?? current?.tabs[0];
+    if (tab?.type === "browser" || tab?.type === "web" || tab?.type === "online") {
+      selectNonTerminalPane();
+    }
+  }, [selectNonTerminalPane, workspaceId, pane.id]);
+
+  const handleAddTab = useCallback((agentId?: string, type?: PaneTab["type"]) => {
+    addTabToPane(workspaceId, pane.id, agentId, type);
+    focusController.focusPaneSoon(pane.id);
+  }, [workspaceId, pane.id, addTabToPane]);
+
+  const handleRemoveTab = useCallback((tabId: string) => {
+    void closePaneOperation({ kind: "tab", workspaceId, paneId: pane.id, tabId }, "ui").then(result => {
+      if (result.status === "closed") focusController.focusPaneSoon(pane.id);
+    });
+  }, [workspaceId, pane.id]);
+
+  const handleSelectTab = useCallback((tabId: string) => {
+    recordPerf("pane.select.click", tabId);
+    const revision = useUiStore.getState().focusRevision;
+    setActivePaneTab(workspaceId, pane.id, tabId);
+    const ws = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+    const p = ws?.panes.find((x) => x.id === pane.id);
+    const tab = p?.tabs.find((t) => t.id === tabId);
+    if (tab && useWorkspaceListStore.getState().activeWorkspaceId === workspaceId
+      && useUiStore.getState().activePaneId === tab.sessionId && useUiStore.getState().focusRevision === revision) {
+      useUiStore.getState().bumpFocusRevision();
+    }
+    if (tab && tab.type !== undefined && tab.type !== "terminal") {
+      if (useWorkspaceListStore.getState().activeWorkspaceId === workspaceId) {
+        useUiStore.getState().setActivePaneId(tab.sessionId);
+      }
+      return;
+    }
+    if (isTerminalTab(tab)) {
+      focusController.request("tab-click", { sessionId: tab.sessionId, focus: true });
+    }
+  }, [workspaceId, pane.id, setActivePaneTab]);
+
+  const handleZoomToggle = useCallback(() => {
+    const currentZoomed = useUiStore.getState().zoomedPaneId;
+    setZoomedPaneId(currentZoomed === pane.id ? null : pane.id);
+    // Restore keyboard focus to this pane's terminal after the layout change.
+    // The keyboard path keeps focus on the xterm textarea, but the toolbar
+    // zoom button moves focus to the <button>; without this the user must
+    // click back into the terminal before typing.
+    focusController.focusPaneSoon(pane.id);
+  }, [pane.id, setZoomedPaneId]);
+
+  const activeTabId = activeTab?.id;
+  const activeTabSourceKind = activeTab?.sourceKind;
+
+  const handleBrowserDirtyChange = useCallback((isDirty: boolean) => {
+    if (!activeTabId) return;
+    setBrowserTabDirty(workspaceId, pane.id, activeTabId, isDirty);
+  }, [workspaceId, pane.id, activeTabId, setBrowserTabDirty]);
+
+  const handleBrowserSaved = useCallback((result: SaveEditableArtifactResult) => {
+    if (!activeTabId) return;
+    refreshBrowserTabPreview(workspaceId, pane.id, activeTabId, {
+      previewPath: result.previewPath,
+      sourcePath: result.sourcePath,
+      sourceKind: activeTabSourceKind ?? "html",
+    });
+  }, [workspaceId, pane.id, activeTabId, activeTabSourceKind, refreshBrowserTabPreview]);
+
+  const handleUrlClick = useCallback((uri: string) => {
+    if (pendingPreviewUriRef.current) return;
+    recordPerf("artifact.link.click");
+    setArtifactLinkPopover(null);
+    pendingPreviewUriRef.current = uri;
+    setPreviewActionError(null);
+
+    const reportOpenFailure = (message: string, error: unknown): void => {
+      const detail = `${message}: ${String(error)}`;
+      console.error("[mycmux] artifact open failed", detail);
+      setPreviewActionError(detail);
+    };
+
+    const workspace = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+    const currentPane = workspace?.panes.find((candidate) => candidate.id === pane.id);
+    const currentTab = currentPane?.tabs.find((tab) => tab.id === currentPane.activeTabId);
+    if (!isTerminalTab(currentTab)) {
+      const opener = isLocalArtifactLink(uri) ? openPathWithDefaultApp(uri) : open(uri);
+      opener
+        .catch((error) => reportOpenFailure(terminalPaneStrings.openFailed, error))
+        .finally(() => {
+          if (pendingPreviewUriRef.current === uri) pendingPreviewUriRef.current = null;
+        });
+      return;
+    }
+    previewArtifactUriForSessionV2(currentTab.sessionId, uri)
+      .then((info) => {
+        openOrReloadHtmlPreviewPane(workspaceId, pane.id, info);
+        setPreviewActionError(null);
+      })
+      .catch((error) => {
+        if (isLocalArtifactLink(uri)) {
+          // In-app preview failed (e.g. unreadable file / backend error). Don't
+          // swallow it into a dead click — fall back to the OS default app so
+          // the user still sees the file open somewhere.
+          console.warn("[mycmux] local artifact preview rejected, opening externally", error);
+          return openPathWithDefaultApp(uri).catch((openError) =>
+            reportOpenFailure(terminalPaneStrings.previewFallbackFailed, openError),
+          );
+        }
+        return open(uri).catch((openError) => reportOpenFailure(terminalPaneStrings.openFailed, openError));
+      })
+      .finally(() => {
+        if (pendingPreviewUriRef.current === uri) {
+          pendingPreviewUriRef.current = null;
+        }
+      });
+  }, [openOrReloadHtmlPreviewPane, pane.id, workspaceId]);
+
+  const reportArtifactActionFailure = useCallback((message: string, error: unknown): void => {
+    const detail = `${message}: ${String(error)}`;
+    console.error("[mycmux] artifact action failed", detail);
+    setPreviewActionError(detail);
+  }, []);
+
+  /**
+   * A link inside a document the pane is previewing.
+   *
+   * Something mycmux can show opens in the preview pane; anything else opens
+   * its location in the file manager. A document never gets to start the file's
+   * default application - that is how a link would run a program.
+   */
+  const handleDocumentLocalLink = useCallback((path: string) => {
+    setPreviewActionError(null);
+    const revealInstead = (error: unknown) => {
+      if (error) {
+        console.warn("[mycmux] document link preview rejected, revealing instead", error);
+      }
+      revealPathInExplorer(path).catch((revealError) => {
+        reportArtifactActionFailure(terminalPaneStrings.revealFailed, revealError);
+      });
+    };
+
+    if (!isArtifactPreviewUri(path)) {
+      revealInstead(null);
+      return;
+    }
+    const workspace = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+    const currentPane = workspace?.panes.find((candidate) => candidate.id === pane.id);
+    const currentTab = currentPane?.tabs.find((tab) => tab.id === currentPane.activeTabId)
+      ?? currentPane?.tabs[0];
+    if (!currentTab) {
+      revealInstead(null);
+      return;
+    }
+    // The pane showing the document is a browser tab, so its own session is the
+    // one that owns the preview written for this file.
+    previewArtifactUriForSessionV2(currentTab.sessionId, path)
+      .then((info) => {
+        openOrReloadHtmlPreviewPane(workspaceId, pane.id, info);
+        setPreviewActionError(null);
+      })
+      .catch(revealInstead);
+  }, [openOrReloadHtmlPreviewPane, pane.id, reportArtifactActionFailure, workspaceId]);
+
+  const handleArtifactLinkClick = useCallback((uri: string, screenPos: { x: number; y: number }) => {
+    if (isArtifactPreviewUri(uri)) {
+      handleUrlClick(uri);
+      return;
+    }
+    if (isDirectoryLikeUri(uri)) {
+      setArtifactLinkPopover(null);
+      setPreviewActionError(null);
+      revealPathInExplorer(uri).catch((error) => {
+        reportArtifactActionFailure(terminalPaneStrings.revealFailed, error);
+      });
+      return;
+    }
+    const root = paneRootRef.current;
+    if (!root) {
+      handleUrlClick(uri);
+      return;
+    }
+    const rect = root.getBoundingClientRect();
+    const popoverWidth = 56;
+    const popoverHeight = 34;
+    const x = Math.max(4, Math.min(screenPos.x - rect.left, Math.max(4, rect.width - popoverWidth - 4)));
+    const y = Math.max(4, Math.min(screenPos.y - rect.top, Math.max(4, rect.height - popoverHeight - 4)));
+    setPreviewActionError(null);
+    artifactFocusReturnRef.current?.cancel();
+    artifactFocusReturnRef.current = captureTemporaryFocusReturn(root,
+      root.ownerDocument.activeElement instanceof HTMLElement ? root.ownerDocument.activeElement : null,
+      () => artifactLinkPopoverRef.current);
+    setArtifactLinkPopover({ uri, x, y });
+  }, [handleUrlClick, reportArtifactActionFailure]);
+
+  const handleOpenArtifactExternally = useCallback(() => {
+    if (!artifactLinkPopover) return;
+    const { uri } = artifactLinkPopover;
+    artifactFocusReturnRef.current?.(artifactLinkPopoverRef.current);
+    setArtifactLinkPopover(null);
+    openPathWithDefaultApp(uri).catch((error) => {
+      reportArtifactActionFailure(terminalPaneStrings.openFailed, error);
+    });
+  }, [artifactLinkPopover, reportArtifactActionFailure]);
+
+  const handleRevealArtifactInExplorer = useCallback(() => {
+    if (!artifactLinkPopover) return;
+    const { uri } = artifactLinkPopover;
+    artifactFocusReturnRef.current?.(artifactLinkPopoverRef.current);
+    setArtifactLinkPopover(null);
+    revealPathInExplorer(uri).catch((error) => {
+      reportArtifactActionFailure(terminalPaneStrings.revealFailed, error);
+    });
+  }, [artifactLinkPopover, reportArtifactActionFailure]);
+
+  const { paneCwd, resolvedAgentId, agent, savedAgentSession, launchCommand, launchArgs, launchEnv } = useTerminalPaneLaunch(pane, activeTab);
+  useTearoutAttachmentRevision();
+  const hoverFocusEnabled = usePaneHoverFocus(hoverContentRef, {
+    enabled: !!activeTab && isTerminalTab(activeTab) && isRestorableTab(activeTab) && !!agent
+      && isPaneVisible && !startupSessionPending && !isTearoutSessionDormant(activeTab.sessionId),
+    workspaceId, paneId: pane.id, tabId: activeTab?.id ?? "", sessionId: activeTab?.sessionId ?? "",
+    kind: "terminal", onActivate: (focusGuard, commitHoverSelection, onHoverFocusAborted) => activatePane({ source: "hover", focusGuard, commitHoverSelection, onHoverFocusAborted }),
+  });
+  const retainedTabIds = useRetainedViews(
+    // Every transported live session must attach before the group is acknowledged.
+    [...(activeTab && isTerminalTab(activeTab) && isRestorableTab(activeTab) && !isTearoutSessionDormant(activeTab.sessionId) && agent ? [activeTab.id] : []),
+      ...pane.tabs.filter(tab => hasTearoutSessionAttachment(tab.sessionId)).map(tab => tab.id)],
+    pane.tabs.filter(tab => isTerminalTab(tab) && isRestorableTab(tab) && !isTearoutSessionDormant(tab.sessionId)).map(tab => ({ id: tab.id, cost: 1 })),
+    retainedTabLimit, retainedTabLimit,
+  );
+  useLayoutEffect(() => {
+    window.dispatchEvent(new CustomEvent("mycmux:workspace-visibility-change"));
+  }, [activeTab?.id]);
+  // Every drop preview - a pane/tab drag and a detached window coming back -
+  // is drawn at the result's real size by PaneDragOverlay. A pane cannot paint
+  // outside its own box, so it could never show a column-wide split.
+
+  return (
+    <div
+      ref={paneRootRef}
+      data-session-id={pane.sessionId}
+      data-pane-session-ids={pane.tabs.map((tab) => tab.sessionId).join(" ")}
+      data-dnd-workspace-id={workspaceId}
+      data-dnd-pane-id={pane.id}
+      data-savepoint-drop-pane="true"
+      data-tearout-handoff-active={detachedHandoffTarget ? "true" : undefined}
+      data-active-pane={isActive && !isZoomed ? "true" : undefined}
+      data-pane-zoomed={isZoomed ? "true" : undefined}
+      tabIndex={-1}
+      onPointerDownCapture={handlePanePointerDownCapture}
+      onPointerUpCapture={handlePanePointerUpCapture}
+      onPointerCancelCapture={handlePanePointerCancelCapture}
+      onClickCapture={handlePaneClickCapture}
+      onFocusCapture={(event) => activateFocusedPreview(event.target)}
+      className={`terminal-pane-border${hasNotification ? " has-notification" : ""}`}
+      style={{
+        ...(isZoomed ? {
+          position: "fixed",
+          top: 0,
+          left: 0,
+          right: 0,
+          bottom: 0,
+          zIndex: 100,
+        } : {
+          position: "relative",
+          width: "100%",
+          height: "100%",
+        }),
+        display: "flex",
+        flexDirection: "column",
+        overflow: "hidden",
+        background: "transparent",
+        ["--pane-border-color" as string]: borderColor,
+        ["--pane-focus-glow" as string]: focusGlow,
+      } as React.CSSProperties & Record<string, string>}
+    >
+      <PaneTabBar
+        pane={pane}
+        workspaceId={workspaceId}
+        hasNotification={hasNotification}
+        isZoomed={isZoomed}
+        isVisible={isPaneVisible}
+        onClose={onClose ? () => {
+          onClose();
+          focusController.focusSessionSoon(useUiStore.getState().activePaneId);
+        } : undefined}
+        onSplitRight={onSplitRight ? () => {
+          onSplitRight();
+          focusController.focusSessionSoon(useUiStore.getState().activePaneId);
+        } : undefined}
+        onSplitDown={onSplitDown ? () => {
+          onSplitDown();
+          focusController.focusSessionSoon(useUiStore.getState().activePaneId);
+        } : undefined}
+        onZoomToggle={handleZoomToggle}
+        onAddTab={handleAddTab}
+        onRemoveTab={handleRemoveTab}
+        onSelectTab={handleSelectTab}
+        hasTerminalBuffer={hasTerminalBuffer}
+      />
+      {previewActionError && (
+        <div
+          style={{
+            color: "var(--cmux-red)",
+            fontSize: 11,
+            padding: "2px 8px",
+            borderBottom: "1px solid var(--cmux-border)",
+            background: "color-mix(in srgb, var(--cmux-red) 10%, transparent)",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+          }}
+          title={previewActionError}
+        >
+          {truncatePaneActionError(previewActionError)}
+        </div>
+      )}
+
+      <div ref={hoverContentRef} data-pane-hover-focus-surface={hoverFocusEnabled ? "terminal" : undefined}
+        data-dnd-handoff-surface={isTerminalTab(activeTab) ? "true" : undefined}
+        style={{ flex: 1, minHeight: 0, overflow: "hidden", position: "relative", background: "transparent" }}>
+        {activeTab?.type === "online" ? (
+          <ErrorBoundary>
+            <OnlinePanel workspaceId={workspaceId} paneId={pane.id} />
+          </ErrorBoundary>
+        ) : activeTab?.type === "browser" && activeTab.htmlPath ? (
+          <ErrorBoundary>
+            <BrowserPane
+              tabId={activeTab.id}
+              htmlPath={activeTab.htmlPath}
+              sourcePath={activeTab.sourcePath}
+              sourceKind={activeTab.sourceKind}
+              previewPath={activeTab.previewPath ?? activeTab.htmlPath}
+              reloadKey={activeTab.reloadCounter ?? 0}
+              isDirty={activeTab.isDirty ?? false}
+              onDirtyChange={handleBrowserDirtyChange}
+              onZoomToggle={handleZoomToggle}
+              onSaved={handleBrowserSaved}
+              onOpenLocalPath={handleDocumentLocalLink}
+            />
+          </ErrorBoundary>
+        ) : activeTab?.type === "launcher" ? (
+          <ErrorBoundary>
+            <LauncherPane
+              workspaceId={workspaceId}
+              paneId={pane.id}
+              tabId={activeTab.id}
+              sessionId={activeTab.sessionId}
+              isActive={isActive}
+              cwd={activeTab.cwd ?? paneCwd}
+            />
+          </ErrorBoundary>
+        ) : activeTab?.type === "web" ? (
+          <div
+            data-web-pane-content="true"
+            style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column" }}
+          >
+            <WebPaneStatusBar tabId={activeTab.id} presetId={activeTab.presetId ?? ""} />
+            <div
+              data-web-pane-host-tab-id={activeTab.id}
+              data-web-pane-preset-id={activeTab.presetId}
+              style={{ flex: 1, minHeight: 0 }}
+            />
+          </div>
+        ) : activeTab && isDeclaredTab(activeTab) ? (
+          <div
+            data-declared-tab-placeholder="true"
+            style={{ display: "grid", placeItems: "center", height: "100%", color: "var(--cmux-text-secondary)", fontSize: 12 }}
+          >
+            まだ起動していません
+          </div>
+        ) : null}
+        {activeTab && !isDeclaredTab(activeTab) && isTearoutSessionDormant(activeTab.sessionId) && (
+          <div data-dormant-transfer-placeholder="true" style={{ display: "grid", placeItems: "center", height: "100%" }}>
+            <button onClick={() => startDormantTearoutSession(activeTab.sessionId)}>{"\u3053\u306e\u30bf\u30d6\u3092\u8d77\u52d5\u3059\u308b"}</button>
+          </div>
+        )}
+        {pane.tabs.filter(tab => retainedTabIds.includes(tab.id) && !isTearoutSessionDormant(tab.sessionId))
+          .sort((left, right) => Number(right.id === activeTab?.id) - Number(left.id === activeTab?.id)).map(tab => (
+          <RetainedTerminalSession
+            key={`${tab.sessionId}:${tearoutAttachmentGeneration(tab.sessionId)}`}
+            pane={pane}
+            tab={tab}
+            workspaceId={workspaceId}
+            visible={tab.id === activeTab?.id}
+            historyVisible={isPaneVisible && tab.id === activeTab?.id}
+            onZoomToggle={handleZoomToggle}
+            onUrlClick={handleUrlClick}
+            onArtifactLinkClick={handleArtifactLinkClick}
+          />
+        ))}
+        {activeTab && isTerminalTab(activeTab) && !isDeclaredTab(activeTab) && agent && startupSessionPending && (
+          <div
+            style={{
+              position: "absolute",
+              inset: 0,
+              display: "grid",
+              placeItems: "center",
+              background: "var(--cmux-bg)",
+              border: "1px solid var(--cmux-border)",
+              color: "var(--cmux-text-secondary)",
+              pointerEvents: "none",
+              zIndex: 1,
+            }}
+          >
+            接続中…
+          </div>
+        )}
+        {(paneHandoffEligibility || detachedHandoffTarget) && (
+          <div
+            className={`pane-handoff-drop-chip${handoffDropTarget || detachedHandoffTarget ? " is-active" : ""}`}
+            data-dnd-handoff-target="true"
+          >
+            {paneDndStrings.handoffDropChip(
+              savepointTargetLabel(detachedHandoffTarget?.targetAgentKind ?? paneHandoffEligibility!.targetAgentKind),
+            )}
+          </div>
+        )}
+        {savepointPaneTargetKind && (
+          <div
+            className={`pane-handoff-drop-chip pane-handoff-drop-chip--savepoint${savepointDropTarget?.mode === "paste" ? " is-active" : ""}`}
+            data-savepoint-paste-target="true"
+          >
+            {onlineStrings.dragGhostPasteTarget(
+              savepointTargetLabel(savepointPaneTargetKind),
+            )}
+          </div>
+        )}
+      </div>
+      {showComposer && activeTab && isTerminalTab(activeTab) && isRestorableTab(activeTab) && agent && (
+        <ErrorBoundary>
+          <PaneComposer
+            sessionId={activeTab.sessionId}
+            target={{
+              command: launchCommand,
+              args: launchArgs,
+              agentId: resolvedAgentId,
+              agentKind: savedAgentSession?.kind ?? activeTab.agentKind ?? activeTabMetadataAgentKind,
+              launchEnv,
+              processTitle: activeTabMetadataProcessTitle,
+            }}
+          />
+        </ErrorBoundary>
+      )}
+      {savepointDropTarget?.mode === "paste" && savepointDropTarget.tabId === activeTab?.id && (
+        <div className="savepoint-write-preview">
+          <span className="savepoint-write-preview__prompt" aria-hidden="true">›</span>
+          <span className="savepoint-write-preview__label">
+            {onlineStrings.dragDropPastePreview(
+              savepointTargetLabel(savepointDropTarget.targetKind),
+            )}
+          </span>
+          <span className="savepoint-write-preview__caret" aria-hidden="true" />
+        </div>
+      )}
+      {savepointDropTarget?.mode === "spawn" && (
+        <div className={`pane-drop-preview pane-drop-preview--${savepointDropTarget.direction} pane-drop-preview--split pane-drop-preview--source-pane`}>
+          <span className="pane-drop-preview__label">
+            {onlineStrings.dragDropFullResumeSplit(savepointDropTarget.direction)}
+          </span>
+        </div>
+      )}
+      {artifactLinkPopover && (
+        <div
+          ref={artifactLinkPopoverRef}
+          data-pane-hover-focus-blocker="true"
+          style={artifactLinkPopoverStyle(artifactLinkPopover)}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          <button
+            type="button"
+            className="pane-action-btn"
+            title="既定のアプリで開く"
+            aria-label="既定のアプリで開く"
+            onClick={handleOpenArtifactExternally}
+            style={artifactLinkPopoverButtonStyle}
+          >
+            <ExternalLinkIcon />
+          </button>
+          <button
+            type="button"
+            className="pane-action-btn"
+            title="エクスプローラーで表示"
+            aria-label="エクスプローラーで表示"
+            onClick={handleRevealArtifactInExplorer}
+            style={artifactLinkPopoverButtonStyle}
+          >
+            <FolderRevealIcon />
+          </button>
+        </div>
+      )}
+    </div>
+  );
+});
+
+function ExternalLinkIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M15 3h6v6"></path>
+      <path d="M10 14 21 3"></path>
+      <path d="M21 14v5a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5"></path>
+    </svg>
+  );
+}
+
+function FolderRevealIcon() {
+  return (
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+      <path d="M12 11v6"></path>
+      <path d="m9 14 3 3 3-3"></path>
+    </svg>
+  );
+}
+
+function artifactLinkPopoverStyle(popover: ArtifactLinkPopoverState): CSSProperties {
+  return {
+    position: "absolute",
+    left: popover.x,
+    top: popover.y,
+    zIndex: 120,
+    background: "var(--cmux-popover)",
+    border: "1px solid var(--cmux-border)",
+    borderRadius: 6,
+    padding: 4,
+    display: "flex",
+    gap: 4,
+    boxShadow: "var(--cmux-shadow-popover)",
+    color: "var(--cmux-text)",
+  };
+}
+
+const artifactLinkPopoverButtonStyle: CSSProperties = {
+  width: 22,
+  height: 22,
+  padding: 0,
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+};

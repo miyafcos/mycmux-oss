@@ -1,0 +1,2 @@
+{"type":"event_msg","timestamp":"2020-01-01T00:00:00Z","ordinal":1,"payload":{"type":"task_started","turn_id":"fixture-turn","root_turn_id":"fixture-turn","started_at":1577836800,"collaboration_mode_kind":"default"}}
+{"type":"response_item","timestamp":"2020-01-01T00:00:01Z","ordinal":2,"payload":{"type":"function_call","id":"fixture-item","name":"sleep","namespace":"functions","arguments":"{\"seconds\":1}","call_id":"fixture-call"}}

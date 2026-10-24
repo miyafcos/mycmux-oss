@@ -1,0 +1,149 @@
+import { onlineStrings } from "../components/online/onlineStrings";
+import { focusController } from "./focusController";
+import { isSessionAlive, joinSavepointSummary, writeToSession } from "./ipc";
+import {
+  resolveLiveSavepointTargetKind,
+  sanitizeSavepointHandoffDraft,
+} from "./savepointHandoff";
+import { usePaneMetadataStore } from "../stores/paneMetadataStore";
+import type { SavepointPasteDropTarget } from "../stores/savepointDragStore";
+import { useToastStore } from "../stores/toastStore";
+import { useWorkspaceLayoutStore } from "../stores/workspaceLayoutStore";
+import { useWorkspaceListStore } from "../stores/workspaceListStore";
+
+const SESSION_READY_TIMEOUT_MS = 2_500;
+const SESSION_READY_POLL_MS = 75;
+
+export function resolveLiveAgentTarget(
+  workspaceId: string,
+  paneId: string,
+  tabId?: string,
+): SavepointPasteDropTarget | null {
+  const workspace = useWorkspaceListStore.getState().getWorkspace(workspaceId);
+  const pane = workspace?.panes.find((candidate) => candidate.id === paneId);
+  if (!pane) return null;
+  const tab = tabId
+    ? pane.tabs.find((candidate) => candidate.id === tabId)
+    : (pane.tabs.find((candidate) => candidate.id === pane.activeTabId) ?? pane.tabs[0]);
+  if (!tab) return null;
+  const metadata = usePaneMetadataStore.getState().metadata[tab.sessionId];
+  const targetKind = resolveLiveSavepointTargetKind(tab, metadata?.agentKind);
+  if (!targetKind) return null;
+  return {
+    mode: "paste",
+    workspaceId,
+    paneId,
+    tabId: tab.id,
+    sessionId: tab.sessionId,
+    targetKind,
+    agentSessionId: metadata?.agentSessionId,
+  };
+}
+
+function revalidateLiveAgentTarget(
+  target: SavepointPasteDropTarget,
+): SavepointPasteDropTarget | null {
+  const latest = resolveLiveAgentTarget(target.workspaceId, target.paneId, target.tabId);
+  // Re-resolution is only a check. Never replace the original recipient pin
+  // with a supported replacement agent on the same terminal.
+  return latest?.sessionId === target.sessionId && latest.targetKind === target.targetKind
+    && (!target.agentSessionId || latest.agentSessionId === target.agentSessionId) ? target : null;
+}
+
+function isApprovalWaiting(sessionId: string): boolean {
+  return usePaneMetadataStore.getState().metadata[sessionId]?.agentStatus === "waiting";
+}
+
+async function waitForSessionAlive(sessionId: string): Promise<boolean> {
+  const deadline = Date.now() + SESSION_READY_TIMEOUT_MS;
+  do {
+    if (await isSessionAlive(sessionId)) return true;
+    await new Promise<void>((resolve) => window.setTimeout(resolve, SESSION_READY_POLL_MS));
+  } while (Date.now() < deadline);
+  return false;
+}
+
+export async function commitSavepointPaste(
+  bundleDir: string,
+  target: SavepointPasteDropTarget,
+  preparingToastId?: string,
+  isCurrent: () => boolean = () => true,
+): Promise<boolean> {
+  let openingToastId = preparingToastId;
+  try {
+    if (!isCurrent()) return false;
+    // Direct savepoint drops have no publication await before this point;
+    // capture their known conversation here too. Pane handoffs already carry
+    // the conversation captured before publishSavepoint.
+    const pinnedTarget = { ...target, agentSessionId: target.agentSessionId
+      ?? resolveLiveAgentTarget(target.workspaceId, target.paneId, target.tabId)?.agentSessionId };
+    const initialTarget = revalidateLiveAgentTarget(pinnedTarget);
+    if (!initialTarget) {
+      useToastStore.getState().pushToast(onlineStrings.dragDropTargetGone, "warning");
+      return false;
+    }
+    if (isApprovalWaiting(initialTarget.sessionId)) {
+      useToastStore.getState().pushToast(onlineStrings.dragDropApprovalBlocked, "warning");
+      return false;
+    }
+    openingToastId ??= useToastStore
+      .getState()
+      .pushToast(onlineStrings.dragDropPreparingDraft, "info");
+
+    const joined = await joinSavepointSummary(bundleDir);
+    if (!isCurrent()) return false;
+    const latestTarget = revalidateLiveAgentTarget(pinnedTarget);
+    if (!latestTarget) {
+      useToastStore.getState().pushToast(onlineStrings.dragDropTargetGone, "warning");
+      return false;
+    }
+    if (isApprovalWaiting(latestTarget.sessionId)) {
+      useToastStore.getState().pushToast(onlineStrings.dragDropApprovalBlocked, "warning");
+      return false;
+    }
+
+    useWorkspaceListStore.getState().setActiveWorkspace(latestTarget.workspaceId);
+    useWorkspaceLayoutStore.getState().setActivePaneTab(
+      latestTarget.workspaceId,
+      latestTarget.paneId,
+      latestTarget.tabId,
+    );
+    focusController.request("drag", { sessionId: latestTarget.sessionId, focus: false });
+
+    if (!(await waitForSessionAlive(latestTarget.sessionId))) {
+      useToastStore.getState().pushToast(onlineStrings.dragDropTargetNotReady, "warning");
+      return false;
+    }
+    if (!isCurrent()) return false;
+    const readyTarget = revalidateLiveAgentTarget(pinnedTarget);
+    if (!readyTarget || isApprovalWaiting(readyTarget.sessionId)) {
+      useToastStore.getState().pushToast(onlineStrings.dragDropTargetGone, "warning");
+      return false;
+    }
+
+    const draft = sanitizeSavepointHandoffDraft(onlineStrings.joinPrompt(joined.handoff_path));
+    await writeToSession(readyTarget.sessionId, draft);
+    // The only keyboard-focus move of this flow, and it happens after the draft
+    // is in place. The activation above deliberately runs with `focus: false` so
+    // the operator is not yanked away and then dragged back once the up-to-2.5s
+    // liveness wait finishes. Focus has to land here though: the draft is typed
+    // without a trailing Enter, so the operator's Enter must reach this pane.
+    focusController.focusSessionSoon(readyTarget.sessionId);
+    useToastStore.getState().pushToast(
+      joined.cwd_missing
+        ? onlineStrings.dragDropPastedCwdMissing
+        : onlineStrings.dragDropPasted,
+      joined.cwd_missing ? "warning" : "info",
+    );
+    return true;
+  } catch (error) {
+    console.error("[mycmux] failed to paste dropped savepoint", error);
+    useToastStore.getState().pushToast(
+      onlineStrings.dragDropErrorPrefix + String(error),
+      "error",
+    );
+    return false;
+  } finally {
+    if (openingToastId) useToastStore.getState().dismissToast(openingToastId);
+  }
+}

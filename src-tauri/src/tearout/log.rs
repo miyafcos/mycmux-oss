@@ -1,0 +1,514 @@
+use serde::{Deserialize, Serialize};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    path::Path,
+    sync::Mutex,
+};
+
+const LIMIT: u64 = 1024 * 1024;
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrabbedKind {
+    #[default]
+    Pane,
+    Tab,
+    Workspace,
+}
+fn one_pane() -> usize {
+    1
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    KeptWindow,
+    HandedOff,
+    HandoffFailed,
+    Docked,
+    EscCancelled,
+    FailedRestored,
+    Reordered,
+    CancelledBeforeTearout,
+    RejectedBusy,
+    RestoreFailed,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ErrorCode {
+    PrepareFailed,
+    ShowFailed,
+    NativeMoveFailed,
+    ReceiveFailed,
+    DockFailed,
+    RollbackFailed,
+    UnexpectedFailure,
+    MoveBusy,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DestinationKind {
+    Handoff,
+    TabStrip,
+    Center,
+    Left,
+    Right,
+    Up,
+    Down,
+    Sidebar,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Destination {
+    kind: DestinationKind,
+    index: Option<usize>,
+    workspace_id: Option<String>,
+    pane_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InputSurface { Band, Strip, Sidebar }
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputEvidence { pointer_id: i64, event_at: f64, trusted: bool, surface: InputSurface }
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseEvidence { point: super::release::ReleasePoint, receiver_window: Option<String>, receiver_epoch: Option<u64>, client_x: Option<f64>, client_y: Option<f64> }
+static INPUT_EVIDENCE_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DragRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    input_evidence: Option<InputEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    release_point: Option<ReleaseEvidence>,
+    drag_id: String,
+    pane_id: String,
+    source_window: String,
+    switch_on: bool,
+    down_at: u64,
+    #[serde(default)]
+    grabbed_kind: GrabbedKind,
+    #[serde(default = "one_pane")]
+    pane_count: usize,
+    outside_at: Option<u64>,
+    shown_at: Option<u64>,
+    visible_at: Option<u64>,
+    native_started_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    start_alignment: Option<super::geometry::StartAlignment>,
+    hover_started_at: Option<u64>,
+    highlighted_at: Option<u64>,
+    receiver_window: Option<String>,
+    released_at: Option<u64>,
+    #[serde(default)]
+    released: bool,
+    #[serde(default)]
+    failure_reason: Option<String>,
+    #[serde(default)]
+    failure_phase: Option<String>,
+    #[serde(default)]
+    failed_session_ids: Vec<String>,
+    esc_at: Option<u64>,
+    layout_done_at: u64,
+    result: Outcome,
+    destination: Option<Destination>,
+    session_id_equal: Option<bool>,
+    scale: Option<f64>,
+    monitor: Option<String>,
+    focus_stolen: bool,
+    errors: Vec<ErrorCode>,
+}
+
+impl DragRecord {
+    pub fn docked(mut self) -> Self {
+        self.result = Outcome::Docked;
+        self.layout_done_at = super::unix_ms();
+        self
+    }
+}
+
+fn identifier(value: &str) -> String {
+    value
+        .chars()
+        .take(128)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn retain_input_evidence(record: &mut DragRecord, test_profile: bool, within_budget: bool) {
+    if !test_profile || !within_budget {
+        record.input_evidence = None; record.release_point = None;
+    }
+}
+
+fn line(mut record: DragRecord, profile: &str) -> Result<Vec<u8>, String> {
+    let has_evidence = record.input_evidence.is_some() || record.release_point.is_some();
+    let within_budget = !has_evidence || INPUT_EVIDENCE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 256;
+    retain_input_evidence(&mut record, crate::test_profile::is_active(), within_budget);
+    record.drag_id = identifier(&record.drag_id);
+    record.pane_id = identifier(&record.pane_id);
+    record.source_window = identifier(&record.source_window);
+    record.receiver_window = record.receiver_window.map(|id| identifier(&id));
+    if let Some(evidence) = &mut record.release_point { evidence.receiver_window = evidence.receiver_window.take().map(|id| identifier(&id)); }
+    if let Some(destination) = &mut record.destination {
+        destination.workspace_id = destination.workspace_id.take().map(|id| identifier(&id));
+        destination.pane_id = destination.pane_id.take().map(|id| identifier(&id));
+    }
+    record.monitor = record
+        .monitor
+        .map(|name| name.chars().filter(|c| !c.is_control()).take(80).collect());
+    record.scale = record
+        .scale
+        .filter(|scale| scale.is_finite() && *scale > 0.0 && *scale <= 16.0);
+    record.errors.truncate(8);
+    record.failure_reason = record.failure_reason.map(|reason| identifier(&reason));
+    record.failure_phase = record.failure_phase.map(|phase| identifier(&phase));
+    record.failed_session_ids.truncate(256);
+    record.failed_session_ids = record.failed_session_ids.into_iter().map(|id| identifier(&id)).collect();
+    record.released = record.released_at.is_some();
+    let mut value = serde_json::to_value(record).map_err(|e| e.to_string())?;
+    value["profile"] = serde_json::Value::String(identifier(profile));
+    value["recorded_at"] = serde_json::json!(super::unix_ms());
+    let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn append_named(root: &Path, stem: &str, bytes: &[u8], limit: u64) -> Result<(), String> {
+    fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let current = root.join(format!("{stem}.jsonl"));
+    if current.metadata().map(|m| m.len()).unwrap_or(0) + bytes.len() as u64 > limit
+        && current.exists()
+    {
+        // Keep every rotated file: the operational evidence is never deleted.
+        let stamp = super::unix_ms();
+        let mut index = 0;
+        let archived = loop {
+            let candidate = root.join(format!("{stem}-{stamp}-{index}.jsonl"));
+            if !candidate.exists() {
+                break candidate;
+            }
+            index += 1;
+        };
+        fs::rename(&current, archived).map_err(|e| e.to_string())?;
+    }
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(current)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|e| e.to_string())
+}
+
+// A hard aggregate cap for performance evidence; never delete older records.
+// Ordinary operational drag records retain their existing rotation contract.
+const PERFORMANCE_BUDGET: u64 = 8 * 1024 * 1024;
+fn append_performance(root: &Path, bytes: &[u8], budget: u64) -> Result<(), String> {
+    let stored: u64 = fs::read_dir(root)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("tearout-performance")
+                && entry.file_name().to_string_lossy().ends_with(".jsonl")
+        })
+        .filter_map(|entry| entry.metadata().ok().map(|metadata| metadata.len()))
+        .sum();
+    if stored.saturating_add(bytes.len() as u64) > budget {
+        return Err("tearout_performance_storage_full".into());
+    }
+    append_named(root, "tearout-performance", bytes, LIMIT)
+}
+
+#[cfg(test)]
+fn append(root: &Path, bytes: &[u8], limit: u64) -> Result<(), String> {
+    append_named(root, "tearout-log", bytes, limit)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceKind {
+    TearoutPerformance,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerformanceRecord {
+    kind: PerformanceKind,
+    drag_id: String,
+    window_label: String,
+    frames: Option<super::performance::Distribution>,
+    native: Option<super::performance::NativeSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum LogRecord {
+    Drag(DragRecord),
+    Performance(PerformanceRecord),
+}
+impl From<DragRecord> for LogRecord {
+    fn from(record: DragRecord) -> Self {
+        Self::Drag(record)
+    }
+}
+
+fn performance_line(mut record: PerformanceRecord, profile: &str) -> Result<Vec<u8>, String> {
+    record.drag_id = identifier(&record.drag_id);
+    record.window_label = identifier(&record.window_label);
+    let mut value = serde_json::to_value(record).map_err(|e| e.to_string())?;
+    value["profile"] = serde_json::json!(identifier(profile));
+    value["recorded_at"] = serde_json::json!(super::unix_ms());
+    let mut bytes = serde_json::to_vec(&value).map_err(|e| e.to_string())?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+pub(super) fn native_summary(
+    id: String,
+    label: String,
+    summary: super::performance::NativeSummary,
+) {
+    // Called after the move, on its sampler/probe thread, never the UI thread.
+    let Ok(root) = crate::test_profile::runtime_dir() else {
+        return;
+    };
+    let profile = crate::test_profile::name().unwrap_or("default");
+    let record = PerformanceRecord {
+        kind: PerformanceKind::TearoutPerformance,
+        drag_id: id,
+        window_label: label,
+        frames: None,
+        native: Some(summary),
+    };
+    if let Ok(bytes) = performance_line(record, profile) {
+        if let Ok(_guard) = LOG_LOCK.lock() {
+            if append_performance(&root, &bytes, PERFORMANCE_BUDGET).is_err() {
+                eprintln!("[tearout] native summary write failed");
+            }
+        }
+    }
+}
+
+/// An isolated test profile may opt into bounded input/release correlation.
+/// No production pointer coordinates or terminal contents are recorded.
+#[tauri::command]
+pub async fn tearout_input_evidence_enabled() -> bool {
+    if !crate::test_profile::is_active() { return false; }
+    tokio::task::spawn_blocking(|| {
+        crate::test_profile::runtime_dir().ok()
+            .and_then(|root| fs::read(root.join("tearout-diagnostics.json")).ok())
+            .filter(|bytes| bytes.len() <= 4096)
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|value| value["input_release"].as_bool() == Some(true))
+    }).await.unwrap_or(false)
+}
+
+#[tauri::command]
+pub async fn tearout_log_record(record: LogRecord) -> Result<(), String> {
+    let root = crate::test_profile::runtime_dir()?;
+    let profile = crate::test_profile::name().unwrap_or("default").to_owned();
+    tokio::task::spawn_blocking(move || {
+        let _guard = LOG_LOCK
+            .lock()
+            .map_err(|_| "tearout_log_lock_failed".to_string())?;
+        match record {
+            LogRecord::Drag(record) => {
+                append_named(&root, "tearout-log", &line(record, &profile)?, LIMIT)
+            }
+            LogRecord::Performance(record) => append_performance(
+                &root,
+                &performance_line(record, &profile)?,
+                PERFORMANCE_BUDGET,
+            ),
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn record() -> DragRecord {
+        serde_json::from_value(serde_json::json!({
+            "drag_id": "drag", "pane_id": "tab", "source_window": "main", "switch_on": true,
+            "down_at": 10, "outside_at": 20, "shown_at": 21, "visible_at": 22,
+            "native_started_at": 25, "highlighted_at": null, "receiver_window": null,
+            "released_at": 100, "layout_done_at": 110, "result": "kept_window", "destination": null,
+            "session_id_equal": true, "scale": 1.5, "monitor": "DISPLAY1", "focus_stolen": false, "errors": []
+        })).unwrap()
+    }
+    #[test]
+    fn log_has_profile_timing_and_only_whitelisted_metadata() {
+        let bytes = line(record(), "perf3").unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["profile"], "perf3");
+        assert_eq!(value["session_id_equal"], true);
+        assert!(value.get("recorded_at").is_some());
+        let mut injected = serde_json::to_value(record()).unwrap();
+        injected["terminal_output"] = serde_json::json!("SECRET");
+        assert!(serde_json::from_value::<DragRecord>(injected).is_err());
+    }
+    #[test]
+    fn input_release_schema_is_bounded_test_only_and_rejects_content() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["input_evidence"] = serde_json::json!({"pointer_id":1,"event_at":100.5,"trusted":false,"surface":"band"});
+        value["release_point"] = serde_json::json!({"point":{"x":-1200.5,"y":-30.0,"at":110,"method":"native_up"}, "receiver_window":"receiver", "receiver_epoch":4, "client_x":100.25,"client_y":50.5});
+        let mut parsed: DragRecord = serde_json::from_value(value.clone()).unwrap();
+        retain_input_evidence(&mut parsed, false, true);
+        assert!(parsed.input_evidence.is_none() && parsed.release_point.is_none());
+        let mut parsed: DragRecord = serde_json::from_value(value.clone()).unwrap();
+        retain_input_evidence(&mut parsed, true, false);
+        assert!(parsed.input_evidence.is_none() && parsed.release_point.is_none());
+        value["input_evidence"]["terminal_output"] = serde_json::json!("forbidden");
+        assert!(serde_json::from_value::<DragRecord>(value).is_err());
+    }
+
+    #[test]
+    fn handoff_records_roundtrip_without_accepting_conversation_content() {
+        for outcome in ["handed_off", "handoff_failed"] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value["result"] = serde_json::json!(outcome);
+            value["destination"] = serde_json::json!({
+                "kind": "handoff", "index": null,
+                "workspace_id": "receiver-workspace", "pane_id": "receiver-pane"
+            });
+            let parsed: LogRecord = serde_json::from_value(value.clone()).unwrap();
+            let LogRecord::Drag(parsed) = parsed else {
+                panic!("wrong record kind");
+            };
+            let logged: serde_json::Value =
+                serde_json::from_slice(&line(parsed, "ho-test").unwrap()).unwrap();
+            assert_eq!(logged["result"], outcome);
+            assert_eq!(logged["destination"]["kind"], "handoff");
+            assert_eq!(logged["session_id_equal"], true);
+            value["destination"]["terminal_output"] = serde_json::json!("SECRET");
+            assert!(serde_json::from_value::<LogRecord>(value).is_err());
+        }
+    }
+    #[test]
+    fn log_records_all_three_grabbed_kinds_and_transported_session_count() {
+        for (kind, count) in [("pane", 1), ("tab", 3), ("workspace", 8)] {
+            let mut value = serde_json::to_value(record()).unwrap();
+            value["grabbed_kind"] = serde_json::json!(kind);
+            value["pane_count"] = serde_json::json!(count);
+            let bytes = line(serde_json::from_value(value).unwrap(), "i3").unwrap();
+            let actual: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(actual["grabbed_kind"], kind);
+            assert_eq!(actual["pane_count"], count);
+        }
+    }
+    #[test]
+    fn performance_records_are_typed_and_rotate_separately() {
+        let record = serde_json::json!({ "kind": "tearout_performance", "drag_id": "drag",
+            "window_label": "receiver", "frames": {"count": 2, "median": 16.75,
+                "p95": 33.5, "max": 33.4, "over20": 1, "over33": 1}, "native": null });
+        let parsed: LogRecord = serde_json::from_value(record.clone()).unwrap();
+        let LogRecord::Performance(parsed) = parsed else {
+            panic!("wrong record kind");
+        };
+        let bytes = performance_line(parsed, "t1test").unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["frames"]["count"], 2);
+        assert_eq!(value["profile"], "t1test");
+        let mut injected = record;
+        injected["terminal_output"] = serde_json::json!("SECRET");
+        assert!(serde_json::from_value::<LogRecord>(injected).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        append_named(
+            dir.path(),
+            "tearout-performance",
+            &bytes,
+            bytes.len() as u64 + 1,
+        )
+        .unwrap();
+        append_named(
+            dir.path(),
+            "tearout-performance",
+            &bytes,
+            bytes.len() as u64 + 1,
+        )
+        .unwrap();
+        let files: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|p| p.unwrap().path())
+            .collect();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|p| p
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("tearout-performance")));
+        assert!(!dir.path().join("tearout-log.jsonl").exists());
+    }
+    #[test]
+    fn recovery_diagnostics_keep_missing_release_unmeasured_and_accept_old_records() {
+        let mut value = serde_json::to_value(record()).unwrap();
+        value["released_at"] = serde_json::Value::Null;
+        value["result"] = serde_json::json!("rejected_busy");
+        value["failure_reason"] = serde_json::json!("tearout_move_busy");
+        value["failure_phase"] = serde_json::json!("restoring");
+        value["failed_session_ids"] = serde_json::json!(["pty-running"]);
+        let typed: DragRecord = serde_json::from_value(value).unwrap();
+        let logged: serde_json::Value = serde_json::from_slice(&line(typed, "s6test").unwrap()).unwrap();
+        assert!(logged["released_at"].is_null());
+        assert_eq!(logged["released"], false);
+        assert_eq!(logged["failure_phase"], "restoring");
+        assert_eq!(logged["failed_session_ids"][0], "pty-running");
+        let old = serde_json::to_value(record()).unwrap();
+        let mut old = old.as_object().unwrap().clone();
+        for key in ["released", "failure_reason", "failure_phase", "failed_session_ids"] { old.remove(key); }
+        assert!(serde_json::from_value::<DragRecord>(serde_json::Value::Object(old)).is_ok());
+    }
+    #[test]
+    fn performance_storage_has_a_hard_cap_without_deleting_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = b"{\"kind\":\"tearout_performance\"}\n";
+        append_performance(dir.path(), bytes, bytes.len() as u64 * 2).unwrap();
+        append_performance(dir.path(), bytes, bytes.len() as u64 * 2).unwrap();
+        assert_eq!(
+            append_performance(dir.path(), bytes, bytes.len() as u64 * 2).unwrap_err(),
+            "tearout_performance_storage_full"
+        );
+        assert_eq!(
+            fs::read(dir.path().join("tearout-performance.jsonl")).unwrap(),
+            bytes.repeat(2)
+        );
+    }
+    #[test]
+    fn rotation_preserves_old_lines_and_appends_whole_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = line(record(), "test").unwrap();
+        append(dir.path(), &bytes, bytes.len() as u64 + 1).unwrap();
+        append(dir.path(), &bytes, bytes.len() as u64 + 1).unwrap();
+        let paths: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(path.metadata().unwrap().len() <= bytes.len() as u64 + 1);
+        }
+    }
+}

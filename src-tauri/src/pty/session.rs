@@ -1,0 +1,2102 @@
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Mutex;
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tauri::ipc::{Channel, InvokeResponseBody};
+use tauri::{AppHandle, Emitter};
+
+use crate::events;
+use crate::perf_timeline::{flow_start, record_flow, FlowStage, FlowToken};
+
+use super::monitor::{MetadataStore, PtyMetadata};
+use super::osc7::Osc7Parser;
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc as std_mpsc;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, Notify};
+
+const SCROLLBACK_CAP: usize = 256 * 1024; // 256 KB
+const FRONTEND_QUEUE_CAP: usize = 256;
+const FRONTEND_FLUSH_INTERVAL_MS: u64 = 16;
+const FRONTEND_SATURATED_FLUSH_INTERVAL_MS: u64 = 4;
+const FRONTEND_BATCH_MAX_BYTES: usize = 64 * 1024;
+const FRONTEND_MAX_INFLIGHT_BYTES: usize = 512 * 1024;
+const FRONTEND_LOW_WATER_BYTES: usize = 256 * 1024;
+const FRONTEND_MAX_INFLIGHT_BATCHES: usize = 16;
+// Two missed 2500 ms ACK windows enter AutoConsume well before the frontend
+// writeTerminalOutput watchdog (30000 ms in XTermWrapper.tsx) resolves a stuck
+// write. A later matching-generation ACK resets stale state and resumes sends.
+const FRONTEND_ACK_TIMEOUT: Duration = Duration::from_millis(2500);
+const FRONTEND_STALE_TIMEOUTS: u32 = 2;
+// A hidden window keeps receiving output instead of dropping it. The renderer
+// parks the batches and replays them incrementally once it paints again, which
+// costs far less than the full scrollback resync AutoConsume forces on every
+// pane at once — on macOS a plain Cmd-Tab hides the whole webview, so that
+// resync used to fire for every visible pane each time the app lost focus.
+// The budget bounds the backlog: past it the stream falls back to AutoConsume
+// and the renderer rebuilds from the 256 KB scrollback snapshot, which loses
+// nothing. 1 MiB is four snapshots' worth of catch-up.
+const FRONTEND_HIDDEN_BUDGET_BYTES: usize = 1024 * 1024;
+const INPUT_QUEUE_MESSAGE_CAP: usize = 256;
+const INPUT_QUEUE_BYTE_CAP: usize = 512 * 1024;
+const INPUT_WRITE_CHUNK_BYTES: usize = 1024;
+const FRONTEND_DATA_FRAME_HEADER_BYTES: usize = 40;
+const SCROLLBACK_FRAME_HEADER_BYTES: usize = 48;
+// v0.7.1 diag: report aggregated PTY metrics every 5 s on stderr.
+// Diagnostic-only; the consumer task is debug-build-gated, so this is unread in
+// release. Allow it explicitly to keep release warning-free.
+#[allow(dead_code)]
+const METRICS_FLUSH_INTERVAL_MS: u64 = 5_000;
+
+fn epoch_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+static LAST_SESSION_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+fn next_session_epoch() -> u64 {
+    loop {
+        let previous = LAST_SESSION_EPOCH.load(Ordering::Relaxed);
+        let next = epoch_millis().max(previous.saturating_add(1));
+        if LAST_SESSION_EPOCH
+            .compare_exchange_weak(previous, next, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return next;
+        }
+    }
+}
+
+fn record_last_output_at(last_output_at: &AtomicU64, at: u64) {
+    last_output_at.store(at, Ordering::Relaxed);
+}
+
+fn read_last_output_at(last_output_at: &AtomicU64) -> Option<u64> {
+    match last_output_at.load(Ordering::Relaxed) {
+        0 => None,
+        at => Some(at),
+    }
+}
+
+// v0.7.1 diag: per-session counters shared by reader/forwarder threads.
+// Used only for stderr reports; no behavior change. The reader task is
+// debug-gated, so some counters are write-only in release — allow dead_code.
+#[derive(Default)]
+#[allow(dead_code)]
+pub(crate) struct PtyMetrics {
+    pub reads: std::sync::atomic::AtomicU64,
+    pub read_micros_total: std::sync::atomic::AtomicU64,
+    pub flushes: std::sync::atomic::AtomicU64,
+    pub flushed_bytes: std::sync::atomic::AtomicU64,
+    pub channel_send_errors: std::sync::atomic::AtomicU64,
+    pub frontend_queue_full_retry: std::sync::atomic::AtomicU64,
+    pub dropped_chunks: std::sync::atomic::AtomicU64,
+    pub dropped_bytes: std::sync::atomic::AtomicU64,
+    pub autoconsume_events: std::sync::atomic::AtomicU64,
+    pub closed_count: std::sync::atomic::AtomicU64,
+}
+
+struct FrontendDataBatch {
+    generation: u64,
+    seq: u64,
+    resync: bool,
+    scrollback_start: u64,
+    scrollback_end: u64,
+    data: Vec<u8>,
+}
+
+impl FrontendDataBatch {
+    fn into_wire(&self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(FRONTEND_DATA_FRAME_HEADER_BYTES + self.data.len());
+        frame.extend_from_slice(b"MCX1");
+        frame.extend_from_slice(&(u32::from(self.resync)).to_le_bytes());
+        frame.extend_from_slice(&self.generation.to_le_bytes());
+        frame.extend_from_slice(&self.seq.to_le_bytes());
+        frame.extend_from_slice(&self.scrollback_start.to_le_bytes());
+        frame.extend_from_slice(&self.scrollback_end.to_le_bytes());
+        frame.extend_from_slice(&self.data);
+        frame
+    }
+}
+
+struct FrontendChunk {
+    data: Vec<u8>,
+    scrollback_start: u64,
+    scrollback_end: u64,
+    trace_token: Option<FlowToken>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrollbackCursor {
+    pub end_offset: u64,
+    pub session_epoch: u64,
+    pub size_revision: u64,
+}
+
+struct ScrollbackGeometry {
+    cols: u16,
+    rows: u16,
+    revision: u64,
+}
+
+impl ScrollbackGeometry {
+    fn new(cols: u16, rows: u16) -> Self { Self { cols, rows, revision: 0 } }
+
+    fn resize_with(
+        &mut self, cols: u16, rows: u16,
+        resize: impl FnOnce(u16, u16) -> Result<(), String>,
+    ) -> Result<(), String> {
+        resize(cols, rows)?;
+        if self.cols != cols || self.rows != rows {
+            self.cols = cols;
+            self.rows = rows;
+            self.revision = self.revision.saturating_add(1);
+        }
+        Ok(())
+    }
+}
+
+pub struct ScrollbackSnapshot {
+    pub data: Vec<u8>,
+    pub start_offset: u64,
+    pub end_offset: u64,
+    pub cols: u16,
+    pub rows: u16,
+    pub session_epoch: u64,
+    pub size_revision: u64,
+    pub is_delta: bool,
+}
+
+fn scrollback_snapshot(
+    scrollback: &VecDeque<u8>, end_offset: u64, session_epoch: u64,
+    geometry: &ScrollbackGeometry, since: Option<&ScrollbackCursor>,
+) -> ScrollbackSnapshot {
+    let ring_start = end_offset.saturating_sub(scrollback.len() as u64);
+    let valid_cursor = since.filter(|cursor| cursor.session_epoch == session_epoch
+        && cursor.size_revision == geometry.revision
+        && cursor.end_offset >= ring_start && cursor.end_offset <= end_offset);
+    let start_offset = valid_cursor.map_or(ring_start, |cursor| cursor.end_offset);
+    let skip = (start_offset - ring_start) as usize;
+    ScrollbackSnapshot {
+        data: scrollback.range(skip..).copied().collect(), start_offset, end_offset,
+        cols: geometry.cols, rows: geometry.rows, session_epoch,
+        size_revision: geometry.revision, is_delta: valid_cursor.is_some(),
+    }
+}
+
+/// PTY output published to broadcast subscribers.
+/// Offsets are absolute byte positions in the session's output stream
+/// (the same space as `ScrollbackSnapshot::{start,end}_offset`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutputChunk {
+    pub data: Vec<u8>,
+    pub start: u64,
+    pub end: u64,
+}
+
+impl ScrollbackSnapshot {
+    pub(crate) fn into_wire(self) -> Vec<u8> {
+        let mut frame = Vec::with_capacity(SCROLLBACK_FRAME_HEADER_BYTES + self.data.len());
+        frame.extend_from_slice(b"MCS2");
+        frame.extend_from_slice(&(u32::from(self.is_delta)).to_le_bytes());
+        frame.extend_from_slice(&self.start_offset.to_le_bytes());
+        frame.extend_from_slice(&self.end_offset.to_le_bytes());
+        frame.extend_from_slice(&self.session_epoch.to_le_bytes());
+        frame.extend_from_slice(&self.size_revision.to_le_bytes());
+        frame.extend_from_slice(&self.cols.to_le_bytes());
+        frame.extend_from_slice(&self.rows.to_le_bytes());
+        frame.extend_from_slice(&0u32.to_le_bytes());
+        frame.extend_from_slice(&self.data);
+        frame
+    }
+
+    // Production consumes these frames in terminalWire.ts; this decoder keeps
+    // Rust round-trip and legacy-layout checks against the same wire contract.
+    #[cfg(test)]
+    fn from_wire(frame: &[u8]) -> Result<Self, String> {
+        if frame.len() < 24 { return Err("Truncated scrollback frame".into()); }
+        let v2 = match &frame[..4] {
+            b"MCS1" => false, b"MCS2" => true,
+            _ => return Err("Invalid scrollback magic".into()),
+        };
+        let header = if v2 { SCROLLBACK_FRAME_HEADER_BYTES } else { 24 };
+        if frame.len() < header { return Err("Truncated scrollback frame".into()); }
+        let u64_at = |offset| u64::from_le_bytes(frame[offset..offset + 8].try_into().unwrap());
+        let start_offset = u64_at(8);
+        let end_offset = u64_at(16);
+        if end_offset.checked_sub(start_offset) != Some((frame.len() - header) as u64) {
+            return Err("Invalid scrollback byte range".into());
+        }
+        Ok(Self {
+            data: frame[header..].to_vec(), start_offset, end_offset,
+            cols: if v2 { u16::from_le_bytes(frame[40..42].try_into().unwrap()) } else { 80 },
+            rows: if v2 { u16::from_le_bytes(frame[42..44].try_into().unwrap()) } else { 24 },
+            session_epoch: if v2 { u64_at(24) } else { 0 },
+            size_revision: if v2 { u64_at(32) } else { 0 },
+            is_delta: v2 && u32::from_le_bytes(frame[4..8].try_into().unwrap()) & 1 != 0,
+        })
+    }
+}
+
+struct QueuedInput {
+    data: Vec<u8>,
+    pending_bytes: Arc<AtomicUsize>,
+    completion: Option<std_mpsc::Sender<Result<(), String>>>,
+}
+
+impl Drop for QueuedInput {
+    fn drop(&mut self) {
+        self.pending_bytes
+            .fetch_sub(self.data.len(), Ordering::Release);
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.send(Err("PTY_INPUT_WRITER_FAILED: input was not written".to_string()));
+        }
+    }
+}
+
+struct InFlight {
+    generation: u64,
+    seq: u64,
+    bytes: usize,
+    sent_at: Instant,
+}
+
+struct FrontendFlowState {
+    data_channel: Channel<InvokeResponseBody>,
+    generation: u64,
+    next_seq: u64,
+    inflight_bytes: usize,
+    inflight: VecDeque<InFlight>,
+    attached: bool,
+    visible: bool,
+    /// Bytes the stream may still deliver while the window is hidden. Refilled
+    /// every time the window comes back.
+    hidden_budget_bytes: usize,
+    stale_timeouts: u32,
+    dropped_since_send: bool,
+    closing: bool,
+}
+
+struct FrontendFlow {
+    inner: Mutex<FrontendFlowState>,
+    notify: Notify,
+}
+
+enum FlowPermit {
+    Send {
+        generation: u64,
+        seq: u64,
+        resync: bool,
+    },
+    AutoConsume,
+    Closed,
+}
+
+enum FlowSendError {
+    Replaced,
+    Closed,
+    Disconnected,
+}
+
+impl FrontendFlow {
+    fn new(data_channel: Channel<InvokeResponseBody>) -> Self {
+        Self {
+            inner: Mutex::new(FrontendFlowState {
+                data_channel,
+                generation: 1,
+                next_seq: 1,
+                inflight_bytes: 0,
+                inflight: VecDeque::with_capacity(FRONTEND_MAX_INFLIGHT_BATCHES),
+                attached: true,
+                visible: true,
+                hidden_budget_bytes: FRONTEND_HIDDEN_BUDGET_BYTES,
+                stale_timeouts: 0,
+                dropped_since_send: false,
+                closing: false,
+            }),
+            notify: Notify::new(),
+        }
+    }
+
+    async fn reserve(&self, bytes: usize) -> FlowPermit {
+        loop {
+            let sleep = tokio::time::sleep(FRONTEND_ACK_TIMEOUT);
+            tokio::pin!(sleep);
+            {
+                let Ok(mut st) = self.inner.lock() else {
+                    return FlowPermit::Closed;
+                };
+                if st.closing {
+                    return FlowPermit::Closed;
+                }
+                if !st.attached || st.stale_timeouts >= FRONTEND_STALE_TIMEOUTS {
+                    st.dropped_since_send = true;
+                    return FlowPermit::AutoConsume;
+                }
+                Self::forgive_expired_locked(&mut st);
+                if st.stale_timeouts >= FRONTEND_STALE_TIMEOUTS {
+                    st.dropped_since_send = true;
+                    return FlowPermit::AutoConsume;
+                }
+                let under_bytes =
+                    st.inflight_bytes.saturating_add(bytes) <= FRONTEND_MAX_INFLIGHT_BYTES;
+                let under_batches = st.inflight.len() < FRONTEND_MAX_INFLIGHT_BATCHES;
+                if !st.visible {
+                    // Hidden windows never wait: a renderer that is not painting
+                    // may also be slow to ACK, and parking the forwarder here
+                    // would stall the PTY drain. Deliver while the budget and the
+                    // in-flight window both allow it, and drop to AutoConsume the
+                    // moment either runs out.
+                    if !under_bytes || !under_batches || st.hidden_budget_bytes < bytes {
+                        st.dropped_since_send = true;
+                        return FlowPermit::AutoConsume;
+                    }
+                    st.hidden_budget_bytes -= bytes;
+                    return Self::reserve_locked(&mut st, bytes);
+                }
+                if under_bytes && under_batches {
+                    return Self::reserve_locked(&mut st, bytes);
+                }
+            }
+
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = &mut sleep => {
+                    if let Ok(mut st) = self.inner.lock() {
+                        Self::forgive_expired_locked(&mut st);
+                    }
+                    self.notify.notify_waiters();
+                }
+            }
+        }
+    }
+
+    fn reserve_locked(st: &mut FrontendFlowState, bytes: usize) -> FlowPermit {
+        let seq = st.next_seq;
+        st.next_seq = st.next_seq.saturating_add(1);
+        let generation = st.generation;
+        let resync = st.dropped_since_send;
+        st.dropped_since_send = false;
+        st.inflight_bytes = st.inflight_bytes.saturating_add(bytes);
+        st.inflight.push_back(InFlight {
+            generation,
+            seq,
+            bytes,
+            sent_at: Instant::now(),
+        });
+        FlowPermit::Send {
+            generation,
+            seq,
+            resync,
+        }
+    }
+
+    fn send_batch(&self, batch: &FrontendDataBatch) -> Result<(), FlowSendError> {
+        let data_channel = {
+            let st = self.inner.lock().map_err(|_| FlowSendError::Closed)?;
+            if st.closing {
+                return Err(FlowSendError::Closed);
+            }
+            if batch.generation != st.generation {
+                return Err(FlowSendError::Replaced);
+            }
+            st.data_channel.clone()
+        };
+        data_channel
+            .send(InvokeResponseBody::Raw(batch.into_wire()))
+            .map_err(|_| FlowSendError::Disconnected)
+    }
+
+    fn mark_dropped(&self) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        if !st.closing {
+            st.dropped_since_send = true;
+            self.notify.notify_waiters();
+        }
+    }
+
+    fn forgive_expired_locked(st: &mut FrontendFlowState) {
+        let now = Instant::now();
+        let mut expired = false;
+        while let Some(front) = st.inflight.front() {
+            if now.duration_since(front.sent_at) < FRONTEND_ACK_TIMEOUT {
+                break;
+            }
+            let item = st.inflight.pop_front().unwrap();
+            st.inflight_bytes = st.inflight_bytes.saturating_sub(item.bytes);
+            expired = true;
+        }
+        if expired {
+            st.stale_timeouts = st.stale_timeouts.saturating_add(1);
+        }
+    }
+
+    fn ack(&self, generation: u64, seq: u64, _bytes: usize) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        if generation != st.generation || st.closing {
+            return;
+        }
+        st.stale_timeouts = 0;
+        let mut acked = false;
+        while let Some(front) = st.inflight.front() {
+            if front.generation != generation || front.seq > seq {
+                break;
+            }
+            let item = st.inflight.pop_front().unwrap();
+            st.inflight_bytes = st.inflight_bytes.saturating_sub(item.bytes);
+            acked = true;
+        }
+        if acked || st.inflight_bytes <= FRONTEND_LOW_WATER_BYTES {
+            self.notify.notify_waiters();
+        }
+    }
+
+    /// A failed post is transient. Only release this reservation: earlier
+    /// successful batches can still be acknowledged, and the next send resyncs.
+    fn retry_failed(&self, generation: u64, seq: u64) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        if generation != st.generation || st.closing {
+            return;
+        }
+        if let Some(index) = st.inflight.iter().position(|item| {
+            item.generation == generation && item.seq == seq
+        }) {
+            if let Some(item) = st.inflight.remove(index) {
+                st.inflight_bytes = st.inflight_bytes.saturating_sub(item.bytes);
+            }
+        }
+        st.dropped_since_send = true;
+        self.notify.notify_waiters();
+    }
+
+    fn handle_send_result(&self, generation: u64, seq: u64, result: &Result<(), FlowSendError>) {
+        match result {
+            Err(FlowSendError::Disconnected) => self.retry_failed(generation, seq),
+            Err(FlowSendError::Replaced) => self.cancel(generation, seq),
+            Ok(()) | Err(FlowSendError::Closed) => {}
+        }
+    }
+
+    fn cancel(&self, generation: u64, seq: u64) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        if generation != st.generation || st.closing {
+            return;
+        }
+        if let Some(index) = st
+            .inflight
+            .iter()
+            .position(|item| item.generation == generation && item.seq == seq)
+        {
+            if let Some(item) = st.inflight.remove(index) {
+                st.inflight_bytes = st.inflight_bytes.saturating_sub(item.bytes);
+            }
+        }
+        st.stale_timeouts = FRONTEND_STALE_TIMEOUTS;
+        st.attached = false;
+        self.notify.notify_waiters();
+    }
+
+    fn replace_channel(
+        &self,
+        data_channel: Channel<InvokeResponseBody>,
+    ) -> Result<(String, String), String> {
+        let mut st = self.inner.lock().map_err(|e| format!("Lock failed: {e}"))?;
+        let old_channel_id = st.data_channel.id().to_string();
+        let new_channel_id = data_channel.id().to_string();
+        st.data_channel = data_channel;
+        st.generation = st.generation.saturating_add(1);
+        st.next_seq = 1;
+        st.inflight.clear();
+        st.inflight_bytes = 0;
+        st.attached = true;
+        st.visible = true;
+        st.hidden_budget_bytes = FRONTEND_HIDDEN_BUDGET_BYTES;
+        st.stale_timeouts = 0;
+        st.dropped_since_send = false;
+        self.notify.notify_waiters();
+        Ok((old_channel_id, new_channel_id))
+    }
+
+    #[cfg(test)]
+    fn set_visible(&self, visible: bool) { self.set_visible_for_channel(visible, None); }
+
+    fn generation(&self) -> u64 {
+        self.inner.lock().map(|st| st.generation).unwrap_or(0)
+    }
+
+    fn retire_channel(&self, channel_id: u32) -> Result<(), String> {
+        let mut st = self.inner.lock().map_err(|e| e.to_string())?;
+        if st.data_channel.id() != channel_id { return Ok(()); }
+        st.generation = st.generation.saturating_add(1);
+        st.attached = false;
+        st.inflight.clear(); st.inflight_bytes = 0; st.dropped_since_send = true;
+        self.notify.notify_waiters();
+        Ok(())
+    }
+
+    fn set_visible_for_channel(&self, visible: bool, channel_id: Option<u32>) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        if channel_id.is_some_and(|id| id != st.data_channel.id()) { return; }
+        st.visible = visible;
+        if visible {
+            st.stale_timeouts = 0;
+            st.hidden_budget_bytes = FRONTEND_HIDDEN_BUDGET_BYTES;
+        }
+        if !visible {
+            // Start the hidden budget from an empty in-flight window so a batch
+            // that was still awaiting an ACK when the window went away cannot
+            // eat into the catch-up the renderer is about to park.
+            st.inflight.clear();
+            st.inflight_bytes = 0;
+        }
+        self.notify.notify_waiters();
+    }
+
+    fn close(&self) {
+        let Ok(mut st) = self.inner.lock() else {
+            return;
+        };
+        st.closing = true;
+        self.notify.notify_waiters();
+    }
+}
+
+#[derive(Default)]
+struct SessionExitState {
+    exited: AtomicBool,
+    reported: AtomicBool,
+}
+
+impl SessionExitState {
+    fn mark_exited(&self) {
+        self.exited.store(true, Ordering::Release);
+    }
+
+    fn has_exited(&self) -> bool {
+        self.exited.load(Ordering::Acquire)
+    }
+
+    fn report_once(&self, report: impl FnOnce()) -> bool {
+        if !self.has_exited() || self.reported.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        report();
+        true
+    }
+}
+
+pub struct PtySession {
+    id: String,
+    child: Mutex<Box<dyn Child + Send + Sync>>,
+    exit_state: Arc<SessionExitState>,
+    master: Mutex<Box<dyn MasterPty + Send>>,
+    scrollback_geometry: Mutex<ScrollbackGeometry>,
+    // Input is enqueued here and drained in FIFO order by a dedicated writer
+    // thread. The Tauri command thread only does a non-blocking enqueue, so a
+    // full conpty buffer can never stall the UI thread anymore.
+    write_tx: mpsc::Sender<QueuedInput>,
+    write_pending_bytes: Arc<AtomicUsize>,
+    writer_failed: Arc<AtomicBool>,
+    input_gate: Mutex<()>,
+    input_revision: AtomicU64,
+    pub broadcast: broadcast::Sender<OutputChunk>,
+    scrollback: Arc<Mutex<VecDeque<u8>>>,
+    scrollback_end: Arc<AtomicU64>,
+    scrollback_dirty: Arc<AtomicBool>,
+    scrollback_flush_gate: Mutex<()>,
+    /// What the last successful flush put on disk, so a flush that would write
+    /// the same bytes again can stop before touching the filesystem.
+    scrollback_written: Mutex<Option<super::scrollback_store::ScrollbackFingerprint>>,
+    last_output_at: Arc<AtomicU64>,
+    session_epoch: u64,
+    observation_owner: super::monitor::ObservationOwner,
+    frontend_flow: Arc<FrontendFlow>,
+    pub created_at: Instant,
+    #[allow(dead_code)]
+    pub(crate) metrics: Arc<PtyMetrics>,
+}
+
+fn initialize_scrollback(preload: &[u8]) -> (VecDeque<u8>, u64) {
+    let mut scrollback = VecDeque::with_capacity(SCROLLBACK_CAP);
+    scrollback.extend(preload.iter().copied());
+    (scrollback, preload.len() as u64)
+}
+
+// Safety: child/master/scrollback/data_channel are behind Mutex and write_tx is
+// itself Send + Sync, so concurrent &PtySession access is serialized.
+unsafe impl Sync for PtySession {}
+
+impl PtySession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
+        session_id: String,
+        command: &str,
+        args: &[String],
+        cols: u16,
+        rows: u16,
+        data_channel: Channel<InvokeResponseBody>,
+        app_handle: AppHandle,
+        cwd: Option<String>,
+        env: Option<std::collections::HashMap<String, String>>,
+        metadata_store: MetadataStore,
+        created_at: Instant,
+        preload: Vec<u8>,
+    ) -> Result<Self, String> {
+        crate::perf_timeline::mark("pty.spawn.enter", Some(&session_id));
+        let pty_system = native_pty_system();
+
+        let size = PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        let pair = pty_system
+            .openpty(size)
+            .map_err(|e| format!("Failed to open PTY: {e}"))?;
+
+        let mut cmd = CommandBuilder::new(command);
+        cmd.args(args);
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("COLORTERM", "truecolor");
+        // Keep the legacy TERM_PROGRAM for shell launcher compatibility.
+        // The public app name is exposed separately via MYCMUX_TERM_PROGRAM.
+        cmd.env("TERM_PROGRAM", "ptrterminal");
+        cmd.env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"));
+        cmd.env("MYCMUX_TERM_PROGRAM", "mycmux");
+
+        if let Some(ref extra_env) = env {
+            for (k, v) in extra_env {
+                cmd.env(k, v);
+            }
+        }
+
+        if let Some(dir) = cwd {
+            if std::path::Path::new(&dir).is_dir() {
+                cmd.cwd(dir);
+            } else if let Some(home) = dirs::home_dir() {
+                cmd.cwd(home);
+            }
+        }
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|e| format!("Failed to spawn command: {e}"))?;
+
+        crate::perf_timeline::mark("pty.spawn.done", Some(&session_id));
+
+        // Drop slave — we only need master
+        drop(pair.slave);
+
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| format!("Failed to get PTY writer: {e}"))?;
+
+        let mut reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| format!("Failed to get PTY reader: {e}"))?;
+
+        // Dedicated writer thread: owns the PTY writer and drains a bounded
+        // FIFO queue. A blocked ConPTY never blocks the Tauri command thread;
+        // producers receive retryable backpressure instead.
+        let (write_tx, mut write_rx) = mpsc::channel::<QueuedInput>(INPUT_QUEUE_MESSAGE_CAP);
+        let write_pending_bytes = Arc::new(AtomicUsize::new(0));
+        let writer_failed = Arc::new(AtomicBool::new(false));
+        let writer_failed_thread = writer_failed.clone();
+        let writer_failed_session_id = session_id.clone();
+        thread::spawn(move || {
+            let mut writer = writer;
+            while let Some(input) = write_rx.blocking_recv() {
+                let mut input = input;
+                let mut broken = false;
+                // Chunk writes to avoid PTY buffer overflow (conpty ~4KB limit).
+                for chunk in input.data.chunks(INPUT_WRITE_CHUNK_BYTES) {
+                    if writer.write_all(chunk).is_err() || writer.flush().is_err() {
+                        broken = true;
+                        break;
+                    }
+                }
+                if broken {
+                    if let Some(completion) = input.completion.take() {
+                        let _ = completion.send(Err("PTY_INPUT_WRITER_FAILED: PTY writer failed during write".to_string()));
+                    }
+                    writer_failed_thread.store(true, Ordering::Release);
+                    // Fires at most once per session: `write` short-circuits on
+                    // `writer_failed` and this thread exits immediately.
+                    crate::diag_warn!(
+                        "pty",
+                        "session {writer_failed_session_id} input writer broke; terminal input is dead"
+                    );
+                    break;
+                }
+                if let Some(completion) = input.completion.take() {
+                    let _ = completion.send(Ok(()));
+                }
+            }
+        });
+
+        // Scrollback backs get_session_scrollback and resume. The broadcast
+        // channel has had no subscriber since the built-in phone server was
+        // removed (2026-09); the send site is guarded by receiver_count(), so
+        // an idle channel costs nothing and a future reader can attach.
+        let (broadcast_tx, _) = broadcast::channel::<OutputChunk>(256);
+        let (initial_scrollback, initial_scrollback_end) = initialize_scrollback(&preload);
+        let scrollback = Arc::new(Mutex::new(initial_scrollback));
+        let scrollback_end = Arc::new(AtomicU64::new(initial_scrollback_end));
+        let scrollback_dirty = Arc::new(AtomicBool::new(false));
+        let last_output_at = Arc::new(AtomicU64::new(0));
+        let session_epoch = next_session_epoch();
+        let observation_owner = super::monitor::ObservationOwner::new(session_epoch, session_id.clone(), metadata_store.clone());
+        let exit_state = Arc::new(SessionExitState::default());
+        let reader_exit_state = exit_state.clone();
+        let broadcast_tx_clone = broadcast_tx.clone();
+        let sb_clone = scrollback.clone();
+        let sb_end_clone = scrollback_end.clone();
+        let sb_dirty_clone = scrollback_dirty.clone();
+        let last_output_at_reader = last_output_at.clone();
+        let (frontend_tx, mut frontend_rx) = mpsc::channel::<FrontendChunk>(FRONTEND_QUEUE_CAP);
+        let frontend_flow = Arc::new(FrontendFlow::new(data_channel));
+
+        // v0.7.1 diag: per-session counters shared by reader/forwarder.
+        let metrics = Arc::new(PtyMetrics::default());
+
+        // v0.7.1 diag: periodic metrics flush to stderr — DEBUG BUILDS ONLY.
+        // Release skips spawning this entirely, removing the per-session 5 s
+        // stderr output and the prior never-terminating task leak: this loop had
+        // no exit condition, so one task per session lingered forever across
+        // open/close churn. Debug keeps it for diagnostics.
+        #[cfg(debug_assertions)]
+        {
+            let metrics_for_log = metrics.clone();
+            let sid_for_log = session_id.clone();
+            tauri::async_runtime::spawn(async move {
+                use std::sync::atomic::Ordering;
+                let mut prev_reads: u64 = 0;
+                loop {
+                    tokio::time::sleep(Duration::from_millis(METRICS_FLUSH_INTERVAL_MS)).await;
+                    let reads = metrics_for_log.reads.load(Ordering::Relaxed);
+                    if reads == prev_reads {
+                        continue;
+                    }
+                    let micros = metrics_for_log.read_micros_total.load(Ordering::Relaxed);
+                    let flushes = metrics_for_log.flushes.load(Ordering::Relaxed);
+                    let flushed_bytes = metrics_for_log.flushed_bytes.load(Ordering::Relaxed);
+                    let send_err = metrics_for_log.channel_send_errors.load(Ordering::Relaxed);
+                    let queue_full = metrics_for_log
+                        .frontend_queue_full_retry
+                        .load(Ordering::Relaxed);
+                    let dropped_c = metrics_for_log.dropped_chunks.load(Ordering::Relaxed);
+                    let dropped_b = metrics_for_log.dropped_bytes.load(Ordering::Relaxed);
+                    let autoconsume = metrics_for_log.autoconsume_events.load(Ordering::Relaxed);
+                    let closed = metrics_for_log.closed_count.load(Ordering::Relaxed);
+                    let avg_read_us = micros.checked_div(reads).unwrap_or(0);
+                    let avg_batch = flushed_bytes.checked_div(flushes).unwrap_or(0);
+                    eprintln!(
+                    "[mycmux-diag pty {}] reads={} avg_read_us={} flushes={} avg_batch={} send_err={} queue_full={} dropped_chunks={} dropped_bytes={} autoconsume={} closed={}",
+                    sid_for_log,
+                    reads,
+                    avg_read_us,
+                    flushes,
+                    avg_batch,
+                    send_err,
+                    queue_full,
+                    dropped_c,
+                    dropped_b,
+                    autoconsume,
+                    closed,
+                );
+                    prev_reads = reads;
+                }
+            });
+        }
+
+        let metrics_forwarder = metrics.clone();
+        let forwarder_flow = frontend_flow.clone();
+        let forwarder_sid = session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            use std::sync::atomic::Ordering;
+            let mut carry: VecDeque<FrontendChunk> = VecDeque::with_capacity(2);
+            let mut send_error_log = crate::watchdog::RateLimit::default();
+            let mut drop_log = crate::watchdog::OutputDropLog::default();
+            loop {
+                let first_chunk = match carry.pop_front() {
+                    Some(chunk) => chunk,
+                    None => match frontend_rx.recv().await {
+                        Some(chunk) => chunk,
+                        None => break,
+                    },
+                };
+                record_flow(
+                    &forwarder_sid,
+                    FlowStage::Queue,
+                    first_chunk.trace_token,
+                    first_chunk.data.len(),
+                );
+                let collect_trace = flow_start();
+                let mut batch = first_chunk.data;
+                let scrollback_start = first_chunk.scrollback_start;
+                let mut scrollback_end = first_chunk.scrollback_end;
+
+                while batch.len() < FRONTEND_BATCH_MAX_BYTES {
+                    let received = match carry.pop_front() {
+                        Some(chunk) => Ok(chunk),
+                        None => frontend_rx.try_recv(),
+                    };
+                    match received {
+                        Ok(chunk) => {
+                            if chunk.scrollback_start != scrollback_end {
+                                carry.push_front(chunk);
+                                break;
+                            }
+                            record_flow(
+                                &forwarder_sid,
+                                FlowStage::Queue,
+                                chunk.trace_token,
+                                chunk.data.len(),
+                            );
+                            batch.extend_from_slice(&chunk.data);
+                            scrollback_end = chunk.scrollback_end;
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => break,
+                        Err(mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                let batch_len = batch.len();
+                record_flow(&forwarder_sid, FlowStage::Collect, collect_trace, batch_len);
+                let reserve_trace = flow_start();
+                let permit = forwarder_flow.reserve(batch_len).await;
+                record_flow(&forwarder_sid, FlowStage::Reserve, reserve_trace, batch_len);
+                if let Some(transition) = drop_log.transition(matches!(&permit, FlowPermit::AutoConsume), Instant::now()) {
+                    crate::watchdog::log_with_memory(format!("[pty] session={forwarder_sid} {transition}"));
+                }
+                match permit {
+                    FlowPermit::Closed => break,
+                    FlowPermit::AutoConsume => {
+                        record_flow(
+                            &forwarder_sid,
+                            FlowStage::AutoConsume,
+                            reserve_trace,
+                            batch_len,
+                        );
+                        metrics_forwarder
+                            .autoconsume_events
+                            .fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
+                    FlowPermit::Send {
+                        generation,
+                        seq,
+                        resync,
+                    } => {
+                        let msg = FrontendDataBatch {
+                            generation,
+                            seq,
+                            resync,
+                            scrollback_start,
+                            scrollback_end,
+                            data: batch,
+                        };
+                        let send_trace = flow_start();
+                        let sent = forwarder_flow.send_batch(&msg);
+                        forwarder_flow.handle_send_result(generation, seq, &sent);
+                        record_flow(&forwarder_sid, FlowStage::Channel, send_trace, batch_len);
+                        match sent {
+                            Ok(()) => {
+                                metrics_forwarder.flushes.fetch_add(1, Ordering::Relaxed);
+                                metrics_forwarder
+                                    .flushed_bytes
+                                    .fetch_add(batch_len as u64, Ordering::Relaxed);
+                            }
+                            Err(FlowSendError::Closed) => {
+                                record_flow(
+                                    &forwarder_sid,
+                                    FlowStage::ChannelError,
+                                    send_trace,
+                                    batch_len,
+                                );
+                                break;
+                            }
+                            Err(FlowSendError::Replaced | FlowSendError::Disconnected) => {
+                                record_flow(
+                                    &forwarder_sid,
+                                    FlowStage::ChannelError,
+                                    send_trace,
+                                    batch_len,
+                                );
+                                let errors = metrics_forwarder
+                                    .channel_send_errors
+                                    .fetch_add(1, Ordering::Relaxed) + 1;
+                                if send_error_log.allow_at(Instant::now()) {
+                                    let reason = if matches!(sent, Err(FlowSendError::Disconnected)) {
+                                        "disconnected"
+                                    } else {
+                                        "replaced"
+                                    };
+                                    crate::watchdog::log_with_memory(format!(
+                                        "[pty] send failed session={forwarder_sid} reason={reason} generation={generation} seq={seq} errors={errors}"
+                                    ));
+                                }
+                                if matches!(sent, Err(FlowSendError::Disconnected)) {
+                                    // Keep the bytes even if no further PTY output arrives.
+                                    // A fresh reservation carries the resync flag and sequence.
+                                    carry.push_front(FrontendChunk {
+                                        data: msg.data,
+                                        scrollback_start,
+                                        scrollback_end,
+                                        trace_token: None,
+                                    });
+                                    tokio::time::sleep(Duration::from_millis(100)).await;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                }
+                let sleep_trace = flow_start();
+                if batch_len < FRONTEND_BATCH_MAX_BYTES {
+                    tokio::time::sleep(Duration::from_millis(FRONTEND_FLUSH_INTERVAL_MS)).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(FRONTEND_SATURATED_FLUSH_INTERVAL_MS))
+                        .await;
+                }
+                record_flow(&forwarder_sid, FlowStage::FlushDelay, sleep_trace, 0);
+            }
+        });
+
+        // Spawn reader thread — blocking I/O, not tokio
+        let sid = session_id.clone();
+        let handle = app_handle.clone();
+        let metrics_reader = metrics.clone();
+        let reader_flow = frontend_flow.clone();
+        let reader_owner = observation_owner.clone();
+        thread::spawn(move || {
+            use std::sync::atomic::Ordering;
+            let mut buf = [0u8; 4096]; // 4KB — matches OS page size
+            let mut osc7 = Osc7Parser::new();
+            let mut frontend_open = true;
+            loop {
+                let read_start = Instant::now();
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        record_last_output_at(&last_output_at_reader, epoch_millis());
+                        let read_micros = read_start.elapsed().as_micros();
+                        let process_trace = flow_start();
+                        record_flow(
+                            &sid,
+                            FlowStage::Read,
+                            process_trace.map(|token| token.since(read_start)),
+                            n,
+                        );
+                        metrics_reader.reads.fetch_add(1, Ordering::Relaxed);
+                        metrics_reader
+                            .read_micros_total
+                            .fetch_add(read_micros as u64, Ordering::Relaxed);
+
+                        // OSC 7: side-channel CWD observation. Bytes are NOT stripped —
+                        // xterm.js ignores unknown OSCs, so passing them through is safe.
+                        if let Some(cwd_raw) = osc7.feed(&buf[..n]) {
+                            let cwd = cwd_raw
+                                .trim_end_matches(['\n', '\r'])
+                                .trim_end_matches('/')
+                                .to_string();
+                            if !cwd.is_empty() { reader_owner.publish(|| {
+                                let prev = metadata_store.get(&sid).filter(|m| m.session_epoch == session_epoch).map(|m| m.clone());
+                                let should_emit = match &prev {
+                                    Some(m) => m.cwd != cwd,
+                                    None => true,
+                                };
+                                if should_emit {
+                                    let meta = match prev {
+                                        Some(old) => PtyMetadata {
+                                            session_id: sid.clone(),
+                                            session_epoch,
+                                            cwd: cwd.clone(),
+                                            git_branch: old.git_branch.clone(),
+                                            process_name: old.process_name.clone(),
+                                            process_status: old.process_status.clone(),
+                                            process_status_at: old.process_status_at,
+                                            last_output_at: old.last_output_at,
+                                            agent_active: old.agent_active,
+                                            claude_session_id: old.claude_session_id.clone(),
+                                            agent_kind: old.agent_kind.clone(),
+                                            live_agent_kind: old.live_agent_kind.clone(),
+                                            agent_session_id: old.agent_session_id.clone(),
+                                            agent_session_trusted: old.agent_session_trusted,
+                                            observed_at: old.observed_at,
+                                            agent_started_at: old.agent_started_at,
+                                            agent_pid: old.agent_pid,
+                                        },
+                                        None => PtyMetadata {
+                                            session_id: sid.clone(),
+                                            session_epoch,
+                                            cwd: cwd.clone(),
+                                            git_branch: None,
+                                            process_name: None,
+                                            process_status: None,
+                                            process_status_at: None,
+                                            last_output_at: None,
+                                            agent_active: false,
+                                            claude_session_id: None,
+                                            agent_kind: None,
+                                            live_agent_kind: None,
+                                            agent_session_id: None,
+                                            agent_session_trusted: false,
+                                            observed_at: None,
+                                            agent_started_at: None,
+                                            agent_pid: None,
+                                        },
+                                    };
+                                    metadata_store.insert(sid.clone(), meta.clone());
+                                    let _ = handle.emit("pty_metadata", meta);
+                                }
+                            }); }
+                        }
+
+                        #[cfg(debug_assertions)]
+                        let send_start = Instant::now();
+                        let chunk = buf[..n].to_vec();
+
+                        // Append before publishing the frontend batch. The
+                        // absolute offsets let a recovering renderer discard
+                        // exactly the bytes already present in its snapshot.
+                        let scrollback_start = sb_end_clone.load(Ordering::Relaxed);
+                        let scrollback_end = scrollback_start.saturating_add(chunk.len() as u64);
+                        if let Ok(mut sb) = sb_clone.lock() {
+                            sb.extend(chunk.iter().copied());
+                            let overflow = sb.len().saturating_sub(SCROLLBACK_CAP);
+                            if overflow > 0 {
+                                drop(sb.drain(..overflow));
+                            }
+                            sb_end_clone.store(scrollback_end, Ordering::Relaxed);
+                            sb_dirty_clone.store(true, Ordering::Release);
+                        }
+                        if frontend_open {
+                            match frontend_tx.try_send(FrontendChunk {
+                                data: chunk.clone(),
+                                scrollback_start,
+                                scrollback_end,
+                                trace_token: flow_start(),
+                            }) {
+                                Ok(()) => {}
+                                Err(mpsc::error::TrySendError::Full(rejected)) => {
+                                    record_flow(
+                                        &sid,
+                                        FlowStage::QueueDrop,
+                                        rejected.trace_token,
+                                        rejected.data.len(),
+                                    );
+                                    reader_flow.mark_dropped();
+                                    metrics_reader
+                                        .frontend_queue_full_retry
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    metrics_reader
+                                        .dropped_chunks
+                                        .fetch_add(1, Ordering::Relaxed);
+                                    metrics_reader
+                                        .dropped_bytes
+                                        .fetch_add(rejected.data.len() as u64, Ordering::Relaxed);
+                                    // Keep draining the PTY even when the renderer is behind.
+                                    // Blocking here lets child stdout/stderr fill up and can make
+                                    // stdin appear frozen, so display catch-up is best-effort.
+                                }
+                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                    metrics_reader.closed_count.fetch_add(1, Ordering::Relaxed);
+                                    frontend_open = false;
+                                }
+                            }
+                        }
+                        record_flow(&sid, FlowStage::ReadProcess, process_trace, n);
+                        #[cfg(debug_assertions)]
+                        let send_micros = send_start.elapsed().as_micros();
+
+                        // Also feed any broadcast subscriber, keeping the
+                        // absolute offsets the desktop path already has.
+                        if broadcast_tx_clone.receiver_count() > 0 {
+                            let _ = broadcast_tx_clone.send(OutputChunk {
+                                data: chunk,
+                                start: scrollback_start,
+                                end: scrollback_end,
+                            });
+                        }
+                        #[cfg(debug_assertions)]
+                        {
+                            // Log slow reads in debug builds only
+                            if read_micros > 1000 || send_micros > 1000 {
+                                eprintln!(
+                                    "[PERF] PTY read: {}μs, channel send: {}μs, bytes: {}",
+                                    read_micros, send_micros, n
+                                );
+                            }
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            // The monitor owns both the event and state-store report, so EOF
+            // and child polling cannot produce duplicate exit notifications.
+            reader_exit_state.mark_exited();
+        });
+
+        Ok(Self {
+            id: session_id,
+            child: Mutex::new(child),
+            exit_state,
+            master: Mutex::new(pair.master),
+            scrollback_geometry: Mutex::new(ScrollbackGeometry::new(cols, rows)),
+            write_tx,
+            write_pending_bytes,
+            writer_failed,
+            input_gate: Mutex::new(()),
+            input_revision: AtomicU64::new(0),
+            broadcast: broadcast_tx,
+            scrollback,
+            scrollback_end,
+            scrollback_dirty,
+            scrollback_flush_gate: Mutex::new(()),
+            scrollback_written: Mutex::new(None),
+            last_output_at,
+            session_epoch,
+            observation_owner,
+            frontend_flow,
+            created_at,
+            metrics,
+        })
+    }
+
+    pub fn replace_data_channel(
+        &self,
+        data_channel: Channel<InvokeResponseBody>,
+    ) -> Result<(String, String), String> {
+        self.frontend_flow.replace_channel(data_channel)
+    }
+
+    pub(crate) fn retire_data_channel(&self, channel_id: u32) -> Result<(), String> { self.frontend_flow.retire_channel(channel_id) }
+
+    pub fn ack_frontend_data(&self, generation: u64, seq: u64, bytes: usize) {
+        self.frontend_flow.ack(generation, seq, bytes);
+    }
+
+    pub fn frontend_generation(&self) -> u64 { self.frontend_flow.generation() }
+
+    /// Content-free observation only: never copy the ring or advance flow/ACK.
+    pub fn progress_snapshot(&self) -> Option<(u64, u64)> {
+        let generation = self.frontend_generation();
+        let end = self.scrollback_end.load(Ordering::Relaxed);
+        (generation == self.frontend_generation()).then_some((generation, end))
+    }
+
+    pub fn set_frontend_visible(&self, visible: bool, channel_id: Option<u32>) {
+        self.frontend_flow.set_visible_for_channel(visible, channel_id);
+    }
+
+    pub fn write(&self, data: &[u8]) -> Result<(), String> {
+        let _input_guard = self
+            .input_gate
+            .lock()
+            .map_err(|_| "PTY_INPUT_WRITER_FAILED: input gate is poisoned".to_string())?;
+        self.enqueue_input(data, None)?;
+        self.input_revision.fetch_add(1, Ordering::AcqRel);
+        Ok(())
+    }
+
+    fn enqueue_input(
+        &self,
+        data: &[u8],
+        completion: Option<std_mpsc::Sender<Result<(), String>>>,
+    ) -> Result<(), String> {
+        // Reserve bytes before the non-blocking enqueue. QueuedInput::drop
+        // releases the reservation after either consumption or rejection.
+        if data.is_empty() {
+            return Ok(());
+        }
+        if self.writer_failed.load(Ordering::Acquire) {
+            return Err("PTY_INPUT_WRITER_FAILED: PTY writer thread has exited".to_string());
+        }
+
+        let bytes = data.len();
+        self.write_pending_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
+                pending
+                    .checked_add(bytes)
+                    .filter(|next| *next <= INPUT_QUEUE_BYTE_CAP)
+            })
+            .map_err(|_| {
+                "PTY_INPUT_BACKPRESSURE: terminal input queue byte limit reached".to_string()
+            })?;
+
+        let input = QueuedInput {
+            data: data.to_vec(),
+            pending_bytes: self.write_pending_bytes.clone(),
+            completion,
+        };
+        match self.write_tx.try_send(input) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err("PTY_INPUT_BACKPRESSURE: terminal input queue is full".to_string())
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.writer_failed.store(true, Ordering::Release);
+                // Fires at most once per session: the guard above short-circuits
+                // every later write once `writer_failed` is set.
+                crate::diag_warn!(
+                    "pty",
+                    "input queue closed for session epoch {}; terminal input is dead",
+                    self.session_epoch
+                );
+                Err("PTY_INPUT_WRITER_FAILED: PTY writer thread has exited".to_string())
+            }
+        }
+    }
+
+    /// Enqueue one complete intervention frame after comparing the revision
+    /// shared by every input producer. The returned receiver resolves only
+    /// when the dedicated PTY writer has written and flushed the whole frame.
+    pub fn write_intervention_if_revision(
+        &self,
+        expected_session_epoch: Option<u64>,
+        expected_revision: u64,
+        data: &[u8],
+    ) -> Result<std_mpsc::Receiver<Result<(), String>>, String> {
+        let _input_guard = self
+            .input_gate
+            .lock()
+            .map_err(|_| "PTY_INPUT_WRITER_FAILED: input gate is poisoned".to_string())?;
+        if expected_session_epoch.is_some_and(|expected| expected != self.session_epoch) {
+            return Err(format!("PTY_SESSION_EPOCH_CONFLICT:{}", self.session_epoch));
+        }
+        let actual = self.input_revision.load(Ordering::Acquire);
+        if actual != expected_revision {
+            return Err(format!("PTY_INPUT_REVISION_CONFLICT:{actual}"));
+        }
+        let (completion_tx, completion_rx) = std_mpsc::channel();
+        self.enqueue_input(data, Some(completion_tx))?;
+        self.input_revision.fetch_add(1, Ordering::AcqRel);
+        Ok(completion_rx)
+    }
+
+    pub fn input_revision(&self) -> u64 {
+        self.input_revision.load(Ordering::Acquire)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
+        // Lock geometry first in both resize and snapshot. Failed PTY resizes
+        // must not publish dimensions the PTY never accepted.
+        let mut geometry = self.scrollback_geometry.lock().map_err(|e| format!("Lock failed: {e}"))?;
+        let master = self.master.lock().map_err(|e| format!("Lock failed: {e}"))?;
+        geometry.resize_with(cols, rows, |cols, rows| {
+            master.resize(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
+                .map_err(|e| format!("Resize failed: {e}"))
+        })
+    }
+
+    pub fn size(&self) -> Result<(u16, u16), String> {
+        let master = self
+            .master
+            .lock()
+            .map_err(|e| format!("Lock failed: {e}"))?;
+        let size = master
+            .get_size()
+            .map_err(|e| format!("Get size failed: {e}"))?;
+        Ok((size.cols, size.rows))
+    }
+
+    pub fn kill(&self) -> Result<(), String> {
+        self.frontend_flow.close();
+        let mut child = self.child.lock().map_err(|e| format!("Lock failed: {e}"))?;
+        child.kill().map_err(|e| format!("Kill failed: {e}"))
+    }
+
+    /// ConPTY may keep its output pipe open after the direct child has exited.
+    pub fn poll_exited(&self) -> bool {
+        if !self.exit_state.has_exited() {
+            if let Ok(mut child) = self.child.lock() {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    self.exit_state.mark_exited();
+                }
+            }
+        }
+        self.exit_state.has_exited()
+    }
+
+    pub fn report_exit_once(
+        &self,
+        app_handle: &AppHandle,
+        state_store: &crate::session_state::SessionStateStore,
+    ) {
+        self.exit_state.report_once(|| {
+            state_store.ingest(
+                self.id.clone(),
+                crate::session_state::Evidence::socket_lifecycle(
+                    crate::session_state::unix_epoch_millis(),
+                    self.session_epoch,
+                    crate::session_state::Lifecycle::Exited,
+                ),
+            );
+            let _ = app_handle.emit(&events::pty_exit_event(&self.id), serde_json::json!({ "session_epoch": self.session_epoch }));
+        });
+    }
+
+    pub fn process_id(&self) -> Option<u32> {
+        if let Ok(child) = self.child.lock() {
+            child.process_id()
+        } else {
+            None
+        }
+    }
+
+    pub fn get_scrollback(&self) -> Vec<u8> {
+        self.scrollback
+            .lock()
+            .map(|sb| sb.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_scrollback_snapshot(&self) -> Result<ScrollbackSnapshot, String> {
+        self.get_scrollback_snapshot_since(None)
+    }
+
+    pub fn get_scrollback_snapshot_since(
+        &self, since: Option<&ScrollbackCursor>,
+    ) -> Result<ScrollbackSnapshot, String> {
+        let geometry = self.scrollback_geometry.lock().map_err(|e| format!("Lock failed: {e}"))?;
+        let scrollback = self.scrollback.lock().map_err(|e| format!("Lock failed: {e}"))?;
+        // The reader updates end_offset under the same scrollback lock, so the
+        // payload and its absolute byte range always describe one observation.
+        Ok(scrollback_snapshot(&scrollback, self.scrollback_end.load(Ordering::Relaxed),
+            self.session_epoch, &geometry, since))
+    }
+
+    pub fn flush_scrollback(&self, dir: &Path, force: bool) -> Result<bool, String> {
+        let _flush_guard = self
+            .scrollback_flush_gate
+            .lock()
+            .map_err(|error| format!("Failed to lock scrollback flusher: {error}"))?;
+        let was_dirty = self.scrollback_dirty.swap(false, Ordering::AcqRel);
+        if !force && !was_dirty {
+            return Ok(false);
+        }
+
+        let snapshot = self.get_scrollback_snapshot().map_err(|error| {
+            self.scrollback_dirty.store(true, Ordering::Release);
+            error
+        })?;
+        let (start_offset, data) =
+            super::scrollback_store::sanitize_ring_head(snapshot.start_offset, &snapshot.data);
+        // Rewriting bytes that are already there buys nothing and costs a full
+        // file replace plus an fsync. The shutdown flush is where this shows:
+        // it forces every session, including all the ones that have produced
+        // nothing since the last periodic flush.
+        let mut written = self
+            .scrollback_written
+            .lock()
+            .map_err(|error| format!("Failed to lock scrollback fingerprint: {error}"))?;
+        match super::scrollback_store::save_if_changed(
+            dir,
+            &self.id,
+            start_offset,
+            snapshot.end_offset,
+            data,
+            &mut written,
+        ) {
+            Ok(wrote) => Ok(wrote),
+            Err(error) => {
+                self.scrollback_dirty.store(true, Ordering::Release);
+                Err(format!("Failed to persist scrollback for {}: {error}", self.id))
+            }
+        }
+    }
+
+    pub fn last_output_at(&self) -> Option<u64> {
+        read_last_output_at(&self.last_output_at)
+    }
+
+    pub(crate) fn observation_owner(&self) -> super::monitor::ObservationOwner { self.observation_owner.clone() }
+
+    pub fn session_epoch(&self) -> u64 {
+        self.session_epoch
+    }
+}
+
+impl Drop for PtySession {
+    fn drop(&mut self) {
+        self.observation_owner.retire();
+        self.frontend_flow.close();
+        let _ = self.kill();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_is_reported_once_after_eof_or_child_exit() {
+        let state = SessionExitState::default();
+        let reports = AtomicUsize::new(0);
+        assert!(!state.report_once(|| {
+            reports.fetch_add(1, Ordering::SeqCst);
+        }));
+        state.mark_exited(); // Reader EOF.
+        assert!(state.report_once(|| {
+            reports.fetch_add(1, Ordering::SeqCst);
+        }));
+        state.mark_exited(); // A later child poll observes the same exit.
+        assert!(!state.report_once(|| {
+            reports.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+        // Recreating the same id gets a new state and may report its own exit.
+        let next = SessionExitState::default();
+        next.mark_exited();
+        assert!(next.report_once(|| {
+            reports.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(reports.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn concurrent_exit_reporters_claim_only_one_report() {
+        let state = SessionExitState::default();
+        state.mark_exited();
+        let reports = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    state.report_once(|| {
+                        reports.fetch_add(1, Ordering::SeqCst);
+                    });
+                });
+            }
+        });
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn preload_scrollback_rebases_offsets_at_zero() {
+        let preload = b"\x1b[31mrestored\x1b[0m\r\nnext line";
+        let (scrollback, end_offset) = initialize_scrollback(preload);
+        let data: Vec<u8> = scrollback.into_iter().collect();
+
+        assert_eq!(data, preload);
+        assert_eq!(end_offset, preload.len() as u64);
+        assert_eq!(end_offset.saturating_sub(data.len() as u64), 0);
+    }
+
+    #[test]
+    fn empty_preload_preserves_fresh_spawn_scrollback_state() {
+        let (scrollback, end_offset) = initialize_scrollback(&[]);
+
+        assert!(scrollback.is_empty());
+        assert_eq!(end_offset, 0);
+    }
+
+    #[test]
+    fn last_output_at_starts_empty_and_tracks_latest_output() {
+        let last_output_at = AtomicU64::new(0);
+        assert_eq!(read_last_output_at(&last_output_at), None);
+
+        record_last_output_at(&last_output_at, 1_725_000_000_123);
+        assert_eq!(read_last_output_at(&last_output_at), Some(1_725_000_000_123));
+
+        record_last_output_at(&last_output_at, 1_725_000_000_456);
+        assert_eq!(read_last_output_at(&last_output_at), Some(1_725_000_000_456));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode throughput gate"]
+    fn bench_last_output_at_update_overhead() {
+        const ITERATIONS: usize = 25_000;
+        const CHUNK_BYTES: usize = 4096;
+        const ROUNDS: usize = 7;
+
+        fn run(track_output: bool) -> Duration {
+            let input = [b'x'; CHUNK_BYTES];
+            let reads = AtomicU64::new(0);
+            let scrollback_end = AtomicU64::new(0);
+            let last_output_at = AtomicU64::new(0);
+            let scrollback = Mutex::new(VecDeque::with_capacity(SCROLLBACK_CAP));
+            let started = Instant::now();
+            for _ in 0..ITERATIONS {
+                reads.fetch_add(1, Ordering::Relaxed);
+                if track_output {
+                    record_last_output_at(&last_output_at, epoch_millis());
+                }
+                let chunk = std::hint::black_box(&input).to_vec();
+                let start = scrollback_end.load(Ordering::Relaxed);
+                if let Ok(mut buffer) = scrollback.lock() {
+                    buffer.extend(chunk.iter().copied());
+                    let overflow = buffer.len().saturating_sub(SCROLLBACK_CAP);
+                    if overflow > 0 {
+                        drop(buffer.drain(..overflow));
+                    }
+                    scrollback_end.store(
+                        start.saturating_add(chunk.len() as u64),
+                        Ordering::Relaxed,
+                    );
+                }
+                std::hint::black_box(scrollback_end.load(Ordering::Relaxed));
+            }
+            std::hint::black_box(reads.load(Ordering::Relaxed));
+            std::hint::black_box(last_output_at.load(Ordering::Relaxed));
+            started.elapsed()
+        }
+
+        let _ = run(false);
+        let _ = run(true);
+        let mut baseline = Vec::with_capacity(ROUNDS);
+        let mut tracked = Vec::with_capacity(ROUNDS);
+        for round in 0..ROUNDS {
+            if round % 2 == 0 {
+                baseline.push(run(false));
+                tracked.push(run(true));
+            } else {
+                tracked.push(run(true));
+                baseline.push(run(false));
+            }
+        }
+        baseline.sort_unstable();
+        tracked.sort_unstable();
+        let baseline_seconds = baseline[ROUNDS / 2].as_secs_f64();
+        let tracked_seconds = tracked[ROUNDS / 2].as_secs_f64();
+        let mib = (ITERATIONS * CHUNK_BYTES) as f64 / (1024.0 * 1024.0);
+        let baseline_mib_s = mib / baseline_seconds;
+        let tracked_mib_s = mib / tracked_seconds;
+        let delta_percent = (tracked_mib_s / baseline_mib_s - 1.0) * 100.0;
+        println!(
+            "lastOutputAt throughput: baseline={baseline_mib_s:.1} MiB/s tracked={tracked_mib_s:.1} MiB/s delta={delta_percent:+.2}%"
+        );
+    }
+
+    fn test_channel() -> Channel<InvokeResponseBody> {
+        Channel::new(|_| Ok(()))
+    }
+
+    fn expect_send(permit: FlowPermit) -> (u64, u64) {
+        let (generation, seq, _) = expect_send_with_resync(permit);
+        (generation, seq)
+    }
+
+    fn expect_send_with_resync(permit: FlowPermit) -> (u64, u64, bool) {
+        match permit {
+            FlowPermit::Send {
+                generation,
+                seq,
+                resync,
+            } => (generation, seq, resync),
+            FlowPermit::AutoConsume => panic!("expected Send permit, got AutoConsume"),
+            FlowPermit::Closed => panic!("expected Send permit, got Closed"),
+        }
+    }
+
+    fn assert_auto_consume(permit: FlowPermit) {
+        match permit {
+            FlowPermit::AutoConsume => {}
+            FlowPermit::Send { .. } => panic!("expected AutoConsume permit, got Send"),
+            FlowPermit::Closed => panic!("expected AutoConsume permit, got Closed"),
+        }
+    }
+
+    fn force_expire_inflight(flow: &FrontendFlow) {
+        let mut st = flow.inner.lock().expect("flow lock poisoned");
+        for item in st.inflight.iter_mut() {
+            item.sent_at = Instant::now() - FRONTEND_ACK_TIMEOUT - Duration::from_millis(1);
+        }
+    }
+
+    fn hidden_budget(flow: &FrontendFlow) -> usize {
+        let st = flow.inner.lock().expect("flow lock poisoned");
+        st.hidden_budget_bytes
+    }
+
+    fn flow_snapshot(flow: &FrontendFlow) -> (u64, u64, usize, usize, bool, u32) {
+        let st = flow.inner.lock().expect("flow lock poisoned");
+        (
+            st.generation,
+            st.next_seq,
+            st.inflight_bytes,
+            st.inflight.len(),
+            st.attached,
+            st.stale_timeouts,
+        )
+    }
+
+    #[tokio::test]
+    async fn reserve_sends_under_low_backlog_and_blocks_when_limits_are_exceeded() {
+        let flow = FrontendFlow::new(test_channel());
+
+        let (generation, seq) = expect_send(flow.reserve(128).await);
+        assert_eq!((generation, seq), (1, 1));
+        assert_eq!(flow_snapshot(&flow), (1, 2, 128, 1, true, 0));
+
+        let oversized = tokio::time::timeout(
+            Duration::from_millis(50),
+            flow.reserve(FRONTEND_MAX_INFLIGHT_BYTES + 1),
+        )
+        .await;
+        assert!(oversized.is_err(), "oversized reserve should block");
+
+        flow.ack(generation, seq, 128);
+        for _ in 0..FRONTEND_MAX_INFLIGHT_BATCHES {
+            expect_send(flow.reserve(1).await);
+        }
+        let too_many_batches =
+            tokio::time::timeout(Duration::from_millis(50), flow.reserve(1)).await;
+        assert!(
+            too_many_batches.is_err(),
+            "reserve over the in-flight batch cap should block"
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_from_stale_generation_is_ignored() {
+        let flow = FrontendFlow::new(test_channel());
+        let (old_generation, old_seq) = expect_send(flow.reserve(256).await);
+        flow.replace_channel(test_channel())
+            .expect("replace channel");
+
+        flow.ack(old_generation, old_seq, 256);
+
+        assert_eq!(flow_snapshot(&flow), (2, 1, 0, 0, true, 0));
+    }
+
+    #[tokio::test]
+    async fn ack_from_current_generation_releases_inflight_and_resets_stale_bookkeeping() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, seq1) = expect_send(flow.reserve(100).await);
+        let (_, seq2) = expect_send(flow.reserve(200).await);
+        {
+            let mut st = flow.inner.lock().expect("flow lock poisoned");
+            st.stale_timeouts = 1;
+        }
+
+        flow.ack(generation, seq2, 200);
+
+        assert_eq!(seq1, 1);
+        assert_eq!(flow_snapshot(&flow), (1, 3, 0, 0, true, 0));
+    }
+
+    #[tokio::test]
+    async fn a_single_failed_channel_send_retries_attached_with_resync() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let channel = Channel::new(move |_| {
+            if seen.fetch_add(1, Ordering::Relaxed) == 0 {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "one failed post").into())
+            } else {
+                Ok(())
+            }
+        });
+        let flow = FrontendFlow::new(channel);
+        let (generation, seq, resync) = expect_send_with_resync(flow.reserve(3).await);
+        let mut batch = FrontendDataBatch {
+            generation, seq, resync, scrollback_start: 0, scrollback_end: 3, data: b"abc".to_vec(),
+        };
+        let result = flow.send_batch(&batch);
+        assert!(matches!(result, Err(FlowSendError::Disconnected)));
+        flow.handle_send_result(generation, seq, &result);
+        assert_eq!(flow_snapshot(&flow), (1, 2, 0, 0, true, 0));
+        let (generation, seq, resync) = expect_send_with_resync(flow.reserve(3).await);
+        assert_eq!((generation, seq, resync), (1, 2, true));
+        batch.generation = generation;
+        batch.seq = seq;
+        batch.resync = resync;
+        let result = flow.send_batch(&batch);
+        assert!(result.is_ok());
+        flow.handle_send_result(generation, seq, &result);
+        flow.ack(generation, seq, 3);
+        assert_eq!(attempts.load(Ordering::Relaxed), 2);
+        assert!(!expect_send_with_resync(flow.reserve(1).await).2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_does_not_release_other_inflight_batches_or_a_new_generation() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, first) = expect_send(flow.reserve(10).await);
+        let (_, second) = expect_send(flow.reserve(20).await);
+        flow.handle_send_result(generation, second, &Err(FlowSendError::Disconnected));
+        assert_eq!(flow_snapshot(&flow), (1, 3, 10, 1, true, 0));
+        flow.ack(generation, first, 10);
+        flow.replace_channel(test_channel()).unwrap();
+        flow.handle_send_result(generation, second, &Err(FlowSendError::Disconnected));
+        flow.handle_send_result(generation, second, &Err(FlowSendError::Replaced));
+        assert_eq!(flow_snapshot(&flow), (2, 1, 0, 0, true, 0));
+        assert!(!expect_send_with_resync(flow.reserve(1).await).2);
+    }
+
+    #[tokio::test]
+    async fn replaced_send_still_cancels_its_matching_generation() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, seq) = expect_send(flow.reserve(10).await);
+        flow.handle_send_result(generation, seq, &Err(FlowSendError::Replaced));
+        assert_eq!(flow_snapshot(&flow), (1, 2, 0, 0, false, FRONTEND_STALE_TIMEOUTS));
+        assert_auto_consume(flow.reserve(1).await);
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_channel_detached_after_late_matching_ack() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, seq) = expect_send(flow.reserve(64).await);
+
+        flow.cancel(generation, seq);
+        assert_eq!(
+            flow_snapshot(&flow),
+            (1, 2, 0, 0, false, FRONTEND_STALE_TIMEOUTS)
+        );
+        flow.ack(generation, seq, 64);
+        assert_eq!(flow_snapshot(&flow), (1, 2, 0, 0, false, 0));
+        assert_auto_consume(flow.reserve(64).await);
+        flow.ack(generation, seq, 64);
+        assert_eq!(flow_snapshot(&flow), (1, 2, 0, 0, false, 0));
+
+        let (old_channel_id, new_channel_id) = flow
+            .replace_channel(test_channel())
+            .expect("replace channel after cancel");
+        assert_ne!(old_channel_id, new_channel_id);
+        assert_eq!(flow_snapshot(&flow), (2, 1, 0, 0, true, 0));
+
+        flow.ack(generation, seq, 64);
+        assert_eq!(flow_snapshot(&flow), (2, 1, 0, 0, true, 0));
+    }
+
+    #[tokio::test]
+    async fn stale_timeout_recovers_after_late_current_generation_ack() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, seq1) = expect_send(flow.reserve(32).await);
+
+        force_expire_inflight(&flow);
+        let (_, seq2) = expect_send(flow.reserve(32).await);
+        assert_eq!(flow_snapshot(&flow), (1, 3, 32, 1, true, 1));
+
+        force_expire_inflight(&flow);
+        assert_auto_consume(flow.reserve(32).await);
+        assert_eq!(
+            flow_snapshot(&flow),
+            (1, 3, 0, 0, true, FRONTEND_STALE_TIMEOUTS)
+        );
+
+        flow.ack(generation, seq1, 32);
+        flow.ack(generation, seq2, 32);
+        let recovered = expect_send(flow.reserve(32).await);
+        assert_eq!(recovered, (1, 3));
+        assert_eq!(flow_snapshot(&flow), (1, 4, 32, 1, true, 0));
+    }
+
+    #[tokio::test]
+    async fn autoconsume_marks_next_send_for_single_resync() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, seq1, first_resync) = expect_send_with_resync(flow.reserve(32).await);
+        assert_eq!((generation, seq1, first_resync), (1, 1, false));
+
+        force_expire_inflight(&flow);
+        let (_, seq2, second_resync) = expect_send_with_resync(flow.reserve(32).await);
+        assert_eq!((seq2, second_resync), (2, false));
+
+        force_expire_inflight(&flow);
+        assert_auto_consume(flow.reserve(32).await);
+
+        flow.ack(generation, seq1, 32);
+        flow.ack(generation, seq2, 32);
+        let (recovered_generation, seq3, resync) = expect_send_with_resync(flow.reserve(32).await);
+        assert_eq!((recovered_generation, seq3, resync), (1, 3, true));
+
+        flow.ack(recovered_generation, seq3, 32);
+        let (_, seq4, resync) = expect_send_with_resync(flow.reserve(32).await);
+        assert_eq!((seq4, resync), (4, false));
+    }
+
+    #[tokio::test]
+    async fn dropped_frontend_chunk_marks_exactly_one_following_batch_for_resync() {
+        let flow = FrontendFlow::new(test_channel());
+        let (generation, seq1, resync1) = expect_send_with_resync(flow.reserve(16).await);
+        assert!(!resync1);
+        flow.ack(generation, seq1, 16);
+
+        flow.mark_dropped();
+        let (_, seq2, resync2) = expect_send_with_resync(flow.reserve(16).await);
+        assert!(resync2);
+        flow.ack(generation, seq2, 16);
+
+        let (_, _, resync3) = expect_send_with_resync(flow.reserve(16).await);
+        assert!(!resync3);
+    }
+
+    #[test]
+    fn binary_frames_keep_terminal_payload_bytes_raw() {
+        let data_frame = FrontendDataBatch {
+            generation: 2,
+            seq: 7,
+            resync: true,
+            scrollback_start: 100,
+            scrollback_end: 103,
+            data: vec![65, 66, 67],
+        }
+        .into_wire();
+        assert_eq!(&data_frame[..4], b"MCX1");
+        assert_eq!(data_frame.len(), FRONTEND_DATA_FRAME_HEADER_BYTES + 3);
+        assert_eq!(&data_frame[40..], &[65, 66, 67]);
+
+        let snapshot_frame = ScrollbackSnapshot {
+            data: vec![10, 11],
+            start_offset: 40,
+            end_offset: 42,
+            cols: 120, rows: 40, session_epoch: 17, size_revision: 0, is_delta: false,
+        }
+        .into_wire();
+        assert_eq!(&snapshot_frame[..4], b"MCS2");
+        assert_eq!(snapshot_frame.len(), SCROLLBACK_FRAME_HEADER_BYTES + 2);
+        assert_eq!(&snapshot_frame[48..], &[10, 11]);
+    }
+
+    #[test]
+    fn queued_input_releases_reserved_bytes_when_consumed_or_rejected() {
+        let pending = Arc::new(AtomicUsize::new(3));
+        {
+            let _input = QueuedInput {
+                data: vec![1, 2, 3],
+                pending_bytes: pending.clone(),
+                completion: None,
+            };
+            assert_eq!(pending.load(Ordering::Acquire), 3);
+        }
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn stale_visibility_cannot_hide_a_new_channel_generation() {
+        let old = test_channel();
+        let old_id = old.id();
+        let flow = FrontendFlow::new(old);
+        let fresh = test_channel();
+        let fresh_id = fresh.id();
+        flow.replace_channel(fresh).unwrap();
+        assert_eq!(flow.generation(), 2);
+        flow.set_visible_for_channel(false, Some(old_id));
+        assert!(flow.inner.lock().unwrap().visible);
+        flow.set_visible_for_channel(false, Some(fresh_id));
+        assert!(!flow.inner.lock().unwrap().visible);
+        flow.set_visible_for_channel(true, Some(old_id));
+        assert!(!flow.inner.lock().unwrap().visible);
+    }
+
+    #[tokio::test]
+    async fn hidden_frontend_keeps_delivering_until_the_hidden_budget_is_spent() {
+        // Cmd-Tab on macOS hides the whole webview. Dropping output then costs
+        // every visible pane a full scrollback resync when the window returns,
+        // so a hidden stream keeps flowing until the budget is gone.
+        let flow = FrontendFlow::new(test_channel());
+        flow.set_visible(false);
+
+        let chunk = FRONTEND_HIDDEN_BUDGET_BYTES / 8;
+        for _ in 0..8 {
+            let (generation, seq, resync) = expect_send_with_resync(flow.reserve(chunk).await);
+            assert!(!resync, "an in-budget hidden batch must not ask for a resync");
+            // A parked renderer still ACKs: it queues the batch instead of
+            // painting it.
+            flow.ack(generation, seq, chunk);
+        }
+        assert_eq!(hidden_budget(&flow), 0);
+
+        // Past the budget the stream falls back to AutoConsume, and the first
+        // batch after that tells the renderer to rebuild from the scrollback —
+        // so the overflow is re-read, never silently lost.
+        assert_auto_consume(flow.reserve(chunk).await);
+        flow.set_visible(true);
+        assert_eq!(hidden_budget(&flow), FRONTEND_HIDDEN_BUDGET_BYTES);
+        let (_, _, resync) = expect_send_with_resync(flow.reserve(chunk).await);
+        assert!(resync, "the batch after a hidden overflow must ask for a resync");
+    }
+
+    #[tokio::test]
+    async fn hidden_frontend_reserve_never_parks_the_forwarder() {
+        let flow = FrontendFlow::new(test_channel());
+        flow.set_visible(false);
+        for _ in 0..FRONTEND_MAX_INFLIGHT_BATCHES {
+            expect_send(flow.reserve(1).await);
+        }
+
+        // A visible stream waits for an ACK here. A hidden one must not: the
+        // renderer may be slow to ACK while it is not painting, and parking the
+        // forwarder would stall the PTY drain behind it.
+        let permit = tokio::time::timeout(Duration::from_millis(50), flow.reserve(1))
+            .await
+            .expect("a hidden reserve must answer without waiting");
+        assert_auto_consume(permit);
+    }
+
+    #[tokio::test]
+    async fn set_visible_true_recovers_stale_autoconsume_state() {
+        let flow = FrontendFlow::new(test_channel());
+        expect_send(flow.reserve(32).await);
+
+        force_expire_inflight(&flow);
+        expect_send(flow.reserve(32).await);
+        force_expire_inflight(&flow);
+        assert_auto_consume(flow.reserve(32).await);
+        assert_eq!(
+            flow_snapshot(&flow),
+            (1, 3, 0, 0, true, FRONTEND_STALE_TIMEOUTS)
+        );
+
+        flow.set_visible(true);
+
+        let recovered = expect_send(flow.reserve(32).await);
+        assert_eq!(recovered, (1, 3));
+        assert_eq!(flow_snapshot(&flow), (1, 4, 32, 1, true, 0));
+    }
+}
+
+
+#[cfg(test)]
+mod scrollback_live_tail_tests {
+    use super::*;
+
+    #[test]
+    fn geometry_remembers_spawn_and_successful_resize_only() {
+        let mut geometry = ScrollbackGeometry::new(120, 40);
+        assert_eq!((geometry.cols, geometry.rows, geometry.revision), (120, 40, 0));
+        geometry.resize_with(180, 50, |cols, rows| {
+            assert_eq!((cols, rows), (180, 50));
+            Ok(())
+        }).unwrap();
+        assert_eq!((geometry.cols, geometry.rows, geometry.revision), (180, 50, 1));
+        assert!(geometry.resize_with(80, 24, |_, _| Err("failed".to_string())).is_err());
+        assert_eq!((geometry.cols, geometry.rows, geometry.revision), (180, 50, 1));
+        geometry.resize_with(180, 50, |_, _| Ok(())).unwrap();
+        assert_eq!(geometry.revision, 1);
+        geometry.resize_with(120, 40, |_, _| Ok(())).unwrap();
+        assert_eq!(geometry.revision, 2);
+    }
+
+    #[test]
+    fn snapshot_carries_geometry_epoch_and_slices_only_the_requested_suffix() {
+        let ring = VecDeque::from(vec![10, 11, 12, 13, 14]);
+        let geometry = ScrollbackGeometry::new(120, 40);
+        let snapshot = scrollback_snapshot(&ring, 105, 17, &geometry, None);
+        assert_eq!((snapshot.cols, snapshot.rows, snapshot.session_epoch, snapshot.size_revision), (120, 40, 17, 0));
+        assert_eq!((snapshot.start_offset, snapshot.end_offset, snapshot.is_delta), (100, 105, false));
+        let cursor = ScrollbackCursor { end_offset: 103, session_epoch: 17, size_revision: 0 };
+        let delta = scrollback_snapshot(&ring, 105, 17, &geometry, Some(&cursor));
+        assert_eq!(delta.data, vec![13, 14]);
+        assert_eq!((delta.start_offset, delta.end_offset, delta.is_delta), (103, 105, true));
+        let empty = scrollback_snapshot(&ring, 103, 17, &geometry, Some(&cursor));
+        assert!(empty.data.is_empty());
+        assert!(empty.is_delta);
+    }
+
+    #[test]
+    fn lost_cursor_changed_epoch_or_geometry_require_a_full_reset() {
+        let ring = VecDeque::from(vec![10, 11, 12]);
+        let geometry = ScrollbackGeometry::new(120, 40);
+        for cursor in [
+            ScrollbackCursor { end_offset: 99, session_epoch: 17, size_revision: 0 },
+            ScrollbackCursor { end_offset: 104, session_epoch: 17, size_revision: 0 },
+            ScrollbackCursor { end_offset: 102, session_epoch: 16, size_revision: 0 },
+            ScrollbackCursor { end_offset: 102, session_epoch: 17, size_revision: 1 },
+        ] {
+            let snapshot = scrollback_snapshot(&ring, 103, 17, &geometry, Some(&cursor));
+            assert_eq!(snapshot.data, vec![10, 11, 12]);
+            assert!(!snapshot.is_delta);
+            assert_eq!(snapshot.start_offset, 100);
+        }
+    }
+
+    #[test]
+    fn mcs2_frames_roundtrip_full_and_delta_metadata_and_legacy_mcs1() {
+        let ring = VecDeque::from(vec![65, 66, 67]);
+        let mut geometry = ScrollbackGeometry::new(120, 40);
+        geometry.resize_with(132, 45, |_, _| Ok(())).unwrap();
+        for cursor in [None, Some(ScrollbackCursor { end_offset: 102, session_epoch: 17, size_revision: 1 })] {
+            let snapshot = scrollback_snapshot(&ring, 103, 17, &geometry, cursor.as_ref());
+            let expected_data = snapshot.data.clone();
+            let expected_start = snapshot.start_offset;
+            let expected_delta = snapshot.is_delta;
+            let wire = snapshot.into_wire();
+            assert_eq!(&wire[..4], b"MCS2");
+            assert_eq!(wire.len(), SCROLLBACK_FRAME_HEADER_BYTES + expected_data.len());
+            let decoded = ScrollbackSnapshot::from_wire(&wire).unwrap();
+            assert_eq!(decoded.data, expected_data);
+            assert_eq!((decoded.start_offset, decoded.end_offset, decoded.is_delta), (expected_start, 103, expected_delta));
+            assert_eq!((decoded.cols, decoded.rows, decoded.session_epoch, decoded.size_revision), (132, 45, 17, 1));
+        }
+        let mut legacy = b"MCS1".to_vec();
+        legacy.extend_from_slice(&0u32.to_le_bytes());
+        legacy.extend_from_slice(&40u64.to_le_bytes());
+        legacy.extend_from_slice(&42u64.to_le_bytes());
+        legacy.extend_from_slice(&[10, 11]);
+        let decoded = ScrollbackSnapshot::from_wire(&legacy).unwrap();
+        assert_eq!(decoded.data, vec![10, 11]);
+        assert_eq!((decoded.start_offset, decoded.end_offset), (40, 42));
+        assert_eq!((decoded.cols, decoded.rows, decoded.session_epoch, decoded.size_revision, decoded.is_delta), (80, 24, 0, 0, false));
+        assert!(ScrollbackSnapshot::from_wire(&legacy[..23]).is_err());
+        legacy[0] = 0;
+        assert!(ScrollbackSnapshot::from_wire(&legacy).is_err());
+    }
+}
+
+#[cfg(test)]
+impl PtySession {
+
+    pub(crate) async fn fixture_output(&self, data: &[u8]) -> bool {
+        let FlowPermit::Send { generation, seq, resync } = self.frontend_flow.reserve(data.len()).await else { return false; };
+        let batch = FrontendDataBatch { generation, seq, resync, scrollback_start: 0,
+            scrollback_end: data.len() as u64, data: data.to_vec() };
+        let sent = self.frontend_flow.send_batch(&batch).is_ok();
+        self.frontend_flow.ack(generation, seq, data.len());
+        sent
+    }
+
+    pub(crate) fn fixture_owner(id: &str, pid: u32, age: Duration, store: MetadataStore) -> Self {
+        #[derive(Debug, Clone)]
+        struct FixtureChild(u32);
+        impl portable_pty::ChildKiller for FixtureChild {
+            fn kill(&mut self) -> std::io::Result<()> { Ok(()) }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> { Box::new(self.clone()) }
+        }
+        impl Child for FixtureChild {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> { Ok(None) }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> { Ok(portable_pty::ExitStatus::with_exit_code(0)) }
+            fn process_id(&self) -> Option<u32> { Some(self.0) }
+            #[cfg(windows)]
+            fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> { None }
+        }
+        let (write_tx, _) = mpsc::channel(1);
+        let session_epoch = next_session_epoch();
+        Self {
+            id: id.into(), child: Mutex::new(Box::new(FixtureChild(pid))), master: Mutex::new(native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).unwrap().master),
+            exit_state: Arc::new(SessionExitState::default()), scrollback_geometry: Mutex::new(ScrollbackGeometry::new(80, 24)),
+            write_tx, write_pending_bytes: Arc::new(AtomicUsize::new(0)), writer_failed: Arc::new(AtomicBool::new(false)),
+            input_gate: Mutex::new(()), input_revision: AtomicU64::new(0), broadcast: broadcast::channel(1).0,
+            scrollback: Arc::new(Mutex::new(VecDeque::new())), scrollback_end: Arc::new(AtomicU64::new(0)),
+            scrollback_dirty: Arc::new(AtomicBool::new(false)), scrollback_flush_gate: Mutex::new(()), scrollback_written: Mutex::new(None),
+            last_output_at: Arc::new(AtomicU64::new(0)), session_epoch, observation_owner: super::monitor::ObservationOwner::new(session_epoch, id.into(), store),
+            frontend_flow: Arc::new(FrontendFlow::new(Channel::new(|_| Ok(())))), created_at: Instant::now() - age,
+            metrics: Arc::new(PtyMetrics::default()),
+        }
+    }
+}

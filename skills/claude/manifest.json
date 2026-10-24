@@ -1,0 +1,11 @@
+{
+  "pack_version": "oss-preview-1",
+  "cli": {
+    "path": "scripts/mycmux_agent_cli.py",
+    "sha256": "ee51c46e4eb5d171840d7959c9d5750145d04b5a5109cd80ac39347fa20c7096",
+    "known_sha256": [
+      "ee51c46e4eb5d171840d7959c9d5750145d04b5a5109cd80ac39347fa20c7096"
+    ]
+  },
+  "skills": []
+}

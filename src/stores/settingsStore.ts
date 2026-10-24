@@ -1,0 +1,316 @@
+import { create } from "zustand";
+import { applyAutomaticStoreUpdate, syncedPersist, updateSyncedPersistedField } from "./syncedPersist";
+import {
+  migratePersistedSettings,
+  resolveDefaultTerminalRenderer,
+  SETTINGS_STORE_VERSION,
+  type TerminalRenderer,
+} from "./settingsMigration";
+import { useAiSettingsStore } from "./aiSettingsStore";
+import { initializeAgentServiceVisibility, normalizeAgentServiceVisibility, type AgentServiceDetection } from "../lib/agentServiceVisibility";
+import { isMainWindow } from "../lib/windowContext";
+import type { DshRunRef } from "../lib/agentAdapterApi";
+import { DEFAULT_CONVERSATION_HISTORY_MODE, normalizeConversationHistoryMode, type ConversationHistoryMode } from "../lib/conversationHistory";
+import { DEFAULT_DORMANCY_PRESSURE_SETTINGS, normalizeDormancyPressureSettings, type DormancyPressureSettings } from "../lib/agentDormancy";
+
+export interface LegacyAiFeatureSettings {
+  autoPaneNamingEnabled?: boolean;
+  replyDraftSuggestionsEnabled?: boolean;
+}
+
+export type PaneFocusMode = "click" | "hover";
+
+export function normalizePaneFocusMode(value: unknown): PaneFocusMode {
+  return value === "hover" ? "hover" : "click";
+}
+
+export function parseLegacyAiFeatureSettings(raw: string | null): LegacyAiFeatureSettings {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as { state?: unknown };
+    if (parsed.state === null || typeof parsed.state !== "object" || Array.isArray(parsed.state)) {
+      return {};
+    }
+    const state = parsed.state as Record<string, unknown>;
+    if (state.aiFeatureSettingsDataJsonMigrationComplete === true) return {};
+    const legacy: LegacyAiFeatureSettings = {};
+    if (
+      Object.prototype.hasOwnProperty.call(state, "autoPaneNamingEnabled")
+      && typeof state.autoPaneNamingEnabled === "boolean"
+    ) {
+      legacy.autoPaneNamingEnabled = state.autoPaneNamingEnabled;
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(state, "replyDraftSuggestionsEnabled")
+      && typeof state.replyDraftSuggestionsEnabled === "boolean"
+    ) {
+      legacy.replyDraftSuggestionsEnabled = state.replyDraftSuggestionsEnabled;
+    }
+    return legacy;
+  } catch {
+    return {};
+  }
+}
+
+export function readLegacyAiFeatureSettings(): LegacyAiFeatureSettings {
+  if (typeof localStorage === "undefined") return {};
+  try {
+    return parseLegacyAiFeatureSettings(localStorage.getItem("mycmux-settings"));
+  } catch {
+    return {};
+  }
+}
+
+interface SettingsState {
+  notificationsEnabled: boolean;
+  notificationSoundEnabled: boolean;
+  toastAiActivityEnabled: boolean;
+  toastUserActionEnabled: boolean;
+  toastSystemEnabled: boolean;
+  terminalRenderer: TerminalRenderer;
+  colorAdaptCommands: string[];
+  // CRSM Palette per-kind visibility (Ctrl+P session list).
+  // When false the corresponding kind disappears from both the palette
+  // list and the filter chips. Defaults true so existing users see no
+  // change after upgrade.
+  crsmShowClaude: boolean;
+  crsmShowCodex: boolean;
+  crsmShowClaudeCodex: boolean;
+  hideSessionsWithoutUserMessages: boolean;
+  // Pane tab bar "Split down" (add a row) button. Defaults false —
+  // column splits are the common flow and the row-split button was
+  // mostly a misclick target.
+  showSplitDownButton: boolean;
+  // Pane tab bar "Split right" (add a column) button. Defaults true —
+  // column splits are the primary flow, but the button is toggleable
+  // for symmetry with the split-down button.
+  showSplitRightButton: boolean;
+  /** Windows pane tear-out experiment; opt-in and effective without restart. */
+  nativePaneTearoutEnabled: boolean;
+  /** macOS stays on the legacy route until explicitly enabled on a test Mac. */
+  macNativePaneTearoutEnabled: boolean;
+  /**
+   * Launcher rows the operator has switched off. Values are catalog targets
+   * ("claude", "web-gemini") and the section keys "dev" / "anken" / "resume".
+   * Hiding only, never removing: a built-in comes back by unchecking it, and
+   * an id that no longer exists is ignored rather than breaking the list.
+   */
+  launcherHiddenIds: string[];
+  agentServiceVisibility: Record<string, boolean>;
+  /** Diagram-flight animation shown before a grouping layout commit. */
+  groupingApplyAnimationEnabled: boolean;
+  /** Opt-in compatibility path: close sweep suggestions without human review. */
+  autoSweepCloseWithoutConfirmation: boolean;
+  dormancyPressureSettings: DormancyPressureSettings;
+  dormancyAllowUnreadCompletion: boolean;
+  dispatchWatchdogEnabled: boolean;
+  dispatchWatchdogIntervalMinutes: number;
+  dispatchStallMinutes: number;
+  dispatchWatchdogNotify: boolean;
+  paneComposerEnabled: boolean;
+  paneFocusMode: PaneFocusMode;
+  /** Persisted magnifier routing preference; retain the original storage key. */
+  showTerminalHistoryButton: boolean;
+  conversationHistoryMode: ConversationHistoryMode;
+  /** Content-free terminal progress logging; no polling or writes by default. */
+  terminalProgressDiagnosticsEnabled: boolean;
+  /** Deliberately off until an operator explicitly enables declared-tab launch. */
+  declaredLaunchEnabled: boolean;
+  /** Independent Codex stdio trial; never changes the ordinary launcher. */
+  codexAppServerExperimentEnabled: boolean;
+  /** Independent ACP trial: paths and conversation references only. */
+  dshAcpExperimentEnabled: boolean;
+  dshAcpExecutablePath: string;
+  dshAcpHomePath: string;
+  dshAcpSavedRun: DshRunRef | null;
+  /** AI-generated next-action drafts are opt-in; machine suggestions stay available. */
+  replyDraftSuggestionsEnabled: boolean;
+  /** Rules update only automatically owned display names; user names remain protected. */
+  autoPaneNamingEnabled: boolean;
+  autoWorkspaceNamingEnabled: boolean;
+  /** Provenance marker: compatibility booleans below are no longer legacy input. */
+  aiFeatureSettingsDataJsonMigrationComplete: boolean;
+  appearanceAdvancedOpen: boolean;
+  hydrateAiFeatureSettings: (state: Pick<SettingsState, "autoPaneNamingEnabled" | "replyDraftSuggestionsEnabled">
+    & Partial<Pick<SettingsState, "aiFeatureSettingsDataJsonMigrationComplete" | "autoWorkspaceNamingEnabled">>) => void;
+  setNotificationsEnabled: (v: boolean) => void;
+  setNotificationSoundEnabled: (v: boolean) => void;
+  setToastAiActivityEnabled: (v: boolean) => void;
+  setToastUserActionEnabled: (v: boolean) => void;
+  setToastSystemEnabled: (v: boolean) => void;
+  setTerminalRenderer: (v: TerminalRenderer) => void;
+  setColorAdaptCommands: (v: string[]) => void;
+  setCrsmShowClaude: (v: boolean) => void;
+  setCrsmShowCodex: (v: boolean) => void;
+  setCrsmShowClaudeCodex: (v: boolean) => void;
+  setHideSessionsWithoutUserMessages: (v: boolean) => void;
+  setShowSplitDownButton: (v: boolean) => void;
+  setShowSplitRightButton: (v: boolean) => void;
+  setNativePaneTearoutEnabled: (v: boolean) => void;
+  setLauncherHiddenIds: (v: string[]) => void;
+  setAgentServiceVisible: (target: string, visible: boolean) => void;
+  initializeDetectedAgentServices: (detection: AgentServiceDetection) => void;
+  setGroupingApplyAnimationEnabled: (v: boolean) => void;
+  setAutoSweepCloseWithoutConfirmation: (v: boolean) => void;
+  setDormancyPressureSettings: (v: Partial<DormancyPressureSettings>) => void;
+  setDormancyAllowUnreadCompletion: (v: boolean) => void;
+  setDispatchWatchdogEnabled: (v: boolean) => void;
+  setDispatchWatchdogIntervalMinutes: (v: number) => void;
+  setDispatchStallMinutes: (v: number) => void;
+  setDispatchWatchdogNotify: (v: boolean) => void;
+  setPaneComposerEnabled: (v: boolean) => void;
+  setPaneFocusMode: (v: PaneFocusMode) => void;
+  setShowTerminalHistoryButton: (v: boolean) => void;
+  setConversationHistoryMode: (v: ConversationHistoryMode) => void;
+  setTerminalProgressDiagnosticsEnabled: (v: boolean) => void;
+  setDeclaredLaunchEnabled: (v: boolean) => void;
+  setCodexAppServerExperimentEnabled: (v: boolean) => void;
+  setDshAcpExperimentEnabled: (v: boolean) => void;
+  setDshAcpExecutablePath: (v: string) => void;
+  setDshAcpHomePath: (v: string) => void;
+  setDshAcpSavedRun: (v: DshRunRef | null) => void;
+  setReplyDraftSuggestionsEnabled: (v: boolean) => void;
+  setAutoPaneNamingEnabled: (v: boolean) => void;
+  setAutoWorkspaceNamingEnabled: (v: boolean) => void;
+  setAppearanceAdvancedOpen: (v: boolean) => void;
+}
+
+export const useSettingsStore = create<SettingsState>()(
+  syncedPersist(
+    (set, _get, api) => ({
+      notificationsEnabled: true,
+      notificationSoundEnabled: true,
+      // Off by default: the auto-naming and auto-sweep runs announce results
+      // that are already visible on screen, and the owner asked for the quiet
+      // default (2026-08-28). The setting stays, so it can be turned back on.
+      toastAiActivityEnabled: false,
+      toastUserActionEnabled: true,
+      toastSystemEnabled: true,
+      terminalRenderer: resolveDefaultTerminalRenderer(),
+      colorAdaptCommands: ["agy"],
+      crsmShowClaude: true,
+      crsmShowCodex: true,
+      crsmShowClaudeCodex: true,
+      hideSessionsWithoutUserMessages: true,
+      showSplitDownButton: false,
+      showSplitRightButton: true,
+      // On by default since 0.81.0 (owner's decision 2026-10-02). Windows only;
+      // the settings switch stays as the way back to the previous drag.
+      nativePaneTearoutEnabled: true,
+      // The Mac's own switch: on by default since 0.83.0 (owner's decision
+      // 2026-10-04). Mac installs saved before settings version 7 are switched
+      // on once by the migration (settingsMigration.ts).
+      macNativePaneTearoutEnabled: true,
+      launcherHiddenIds: [],
+      agentServiceVisibility: {},
+      groupingApplyAnimationEnabled: true,
+      autoSweepCloseWithoutConfirmation: false,
+      dormancyPressureSettings: { ...DEFAULT_DORMANCY_PRESSURE_SETTINGS },
+      dormancyAllowUnreadCompletion: true,
+      dispatchWatchdogEnabled: true,
+      dispatchWatchdogIntervalMinutes: 10,
+      dispatchStallMinutes: 45,
+      dispatchWatchdogNotify: true,
+      paneComposerEnabled: true,
+      paneFocusMode: "click",
+      showTerminalHistoryButton: true,
+      conversationHistoryMode: DEFAULT_CONVERSATION_HISTORY_MODE,
+      terminalProgressDiagnosticsEnabled: false,
+      declaredLaunchEnabled: false,
+      codexAppServerExperimentEnabled: false,
+      dshAcpExperimentEnabled: false,
+      dshAcpExecutablePath: "",
+      dshAcpHomePath: "",
+      dshAcpSavedRun: null,
+      replyDraftSuggestionsEnabled: false,
+      autoPaneNamingEnabled: true,
+      autoWorkspaceNamingEnabled: true,
+      aiFeatureSettingsDataJsonMigrationComplete: false,
+      appearanceAdvancedOpen: false,
+      hydrateAiFeatureSettings: (state) => applyAutomaticStoreUpdate(api, state),
+      setNotificationsEnabled: (v) => set({ notificationsEnabled: v }),
+      setNotificationSoundEnabled: (v) => set({ notificationSoundEnabled: v }),
+      setToastAiActivityEnabled: (v) => set({ toastAiActivityEnabled: v }),
+      setToastUserActionEnabled: (v) => set({ toastUserActionEnabled: v }),
+      setToastSystemEnabled: (v) => set({ toastSystemEnabled: v }),
+      setTerminalRenderer: (v) => set({ terminalRenderer: v }),
+      setColorAdaptCommands: (v) => set({ colorAdaptCommands: v }),
+      setCrsmShowClaude: (v) => set({ crsmShowClaude: v }),
+      setCrsmShowCodex: (v) => set({ crsmShowCodex: v }),
+      setCrsmShowClaudeCodex: (v) => set({ crsmShowClaudeCodex: v }),
+      setHideSessionsWithoutUserMessages: (v) => set({ hideSessionsWithoutUserMessages: v }),
+      setShowSplitDownButton: (v) => set({ showSplitDownButton: v }),
+      setShowSplitRightButton: (v) => set({ showSplitRightButton: v }),
+      setNativePaneTearoutEnabled: (v) => set({ nativePaneTearoutEnabled: v,
+        ...(typeof navigator !== "undefined" && /^Mac/i.test(navigator.platform) ? { macNativePaneTearoutEnabled: v } : {}) }),
+      setLauncherHiddenIds: (v) => set({ launcherHiddenIds: v }),
+      setAgentServiceVisible: (target, visible) => updateSyncedPersistedField(api, "agentServiceVisibility",
+        (stored) => ({ ...normalizeAgentServiceVisibility(stored), [target]: visible })),
+      initializeDetectedAgentServices: (detection) => {
+        if (!isMainWindow() || detection.status !== "success") return;
+        updateSyncedPersistedField(api, "agentServiceVisibility",
+          (stored) => initializeAgentServiceVisibility(normalizeAgentServiceVisibility(stored), detection, true));
+      },
+      setGroupingApplyAnimationEnabled: (v) => set({ groupingApplyAnimationEnabled: v }),
+      setAutoSweepCloseWithoutConfirmation: (v) => set({ autoSweepCloseWithoutConfirmation: v }),
+      setDormancyPressureSettings: (v) => set((state) => ({
+        dormancyPressureSettings: normalizeDormancyPressureSettings({ ...state.dormancyPressureSettings, ...v }),
+      })),
+      setDormancyAllowUnreadCompletion: (v) => set({ dormancyAllowUnreadCompletion: v }),
+      setDispatchWatchdogEnabled: (v) => set({ dispatchWatchdogEnabled: v }),
+      setDispatchWatchdogIntervalMinutes: (v) => set({ dispatchWatchdogIntervalMinutes: v }),
+      setDispatchStallMinutes: (v) => set({ dispatchStallMinutes: v }),
+      setDispatchWatchdogNotify: (v) => set({ dispatchWatchdogNotify: v }),
+      setPaneComposerEnabled: (v) => set({ paneComposerEnabled: v }),
+      setPaneFocusMode: (v) => set({ paneFocusMode: normalizePaneFocusMode(v) }),
+      setShowTerminalHistoryButton: (v) => set({ showTerminalHistoryButton: v }),
+      setConversationHistoryMode: (v) => set({ conversationHistoryMode: normalizeConversationHistoryMode(v) }),
+      setTerminalProgressDiagnosticsEnabled: (v) => set({ terminalProgressDiagnosticsEnabled: v }),
+      setDeclaredLaunchEnabled: (v) => set({ declaredLaunchEnabled: v }),
+      setCodexAppServerExperimentEnabled: (v) => set({ codexAppServerExperimentEnabled: v }),
+      setDshAcpExperimentEnabled: (v) => set({ dshAcpExperimentEnabled: v }),
+      setDshAcpExecutablePath: (v) => set({ dshAcpExecutablePath: v }),
+      setDshAcpHomePath: (v) => set({ dshAcpHomePath: v }),
+      setDshAcpSavedRun: (v) => set({ dshAcpSavedRun: v ? {
+        runId: v.runId, generation: v.generation, convId: v.convId, cwd: v.cwd,
+      } : null }),
+      setReplyDraftSuggestionsEnabled: (v) => {
+        useAiSettingsStore.getState().setPersistedReplyDraftSuggestionsEnabled(v);
+        set({ replyDraftSuggestionsEnabled: v });
+      },
+      setAutoWorkspaceNamingEnabled: (v) => {
+        useAiSettingsStore.getState().setPersistedAutoWorkspaceNamingEnabled(v);
+        set({ autoWorkspaceNamingEnabled: v });
+      },
+      setAutoPaneNamingEnabled: (v) => {
+        useAiSettingsStore.getState().setPersistedAutoPaneNamingEnabled(v);
+        set({ autoPaneNamingEnabled: v });
+      },
+      setAppearanceAdvancedOpen: (v) => set({ appearanceAdvancedOpen: v }),
+    }),
+    {
+      name: "mycmux-settings",
+      version: SETTINGS_STORE_VERSION,
+      merge: (persisted, current) => {
+        const merged = { ...current, ...(persisted as Partial<SettingsState> | undefined) };
+        merged.conversationHistoryMode = normalizeConversationHistoryMode((persisted as Partial<SettingsState> | undefined)?.conversationHistoryMode);
+        merged.agentServiceVisibility = normalizeAgentServiceVisibility(merged.agentServiceVisibility);
+        merged.paneFocusMode = normalizePaneFocusMode((persisted as Partial<SettingsState> | undefined)?.paneFocusMode);
+        merged.dormancyPressureSettings = normalizeDormancyPressureSettings(merged.dormancyPressureSettings ?? {});
+        // Older Mac installs carry the Windows-default true field. It is not
+        // consent to the Mac experiment; only the new explicit marker is.
+        if (typeof navigator !== "undefined" && /^Mac/i.test(navigator.platform)) {
+          merged.nativePaneTearoutEnabled = merged.macNativePaneTearoutEnabled === true;
+        }
+        return merged;
+      },
+      migrate: (persistedState, persistedVersion) => (
+        migratePersistedSettings(persistedState, persistedVersion) as SettingsState
+      ),
+    },
+  ),
+);
+
+export function markAiFeatureSettingsDataJsonMigrationComplete(): void {
+  applyAutomaticStoreUpdate(useSettingsStore, { aiFeatureSettingsDataJsonMigrationComplete: true });
+}

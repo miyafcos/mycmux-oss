@@ -1,0 +1,697 @@
+[
+  {
+    "tool": "cargo",
+    "message": "unused imports: `LedgerError`, `LedgerRecord`, and `ReservedObservation`",
+    "location": "src/agent_state/mod.rs:11:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `ROLLOUT_GRACE_MS`",
+    "location": "src/agent_state/mod.rs:14:34"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused imports: `CapabilityGrant`, `HOOK_BODY_MAX_DEPTH`, `HOOK_CAP_MAX_BYTES`, `HOOK_COMMAND_MAX_BYTES`, `HOOK_QUEUE_CAPACITY`, `HOOK_STRING_MAX_BYTES`, `HookMetricsSnapshot`, and `validate_value_bounds`",
+    "location": "src/agent_state/mod.rs:19:21"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `export_privacy as privacy`",
+    "location": "src/agent_design/export.rs:1:34"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `model::*`",
+    "location": "src/agent_design/skill_read.rs:1:26"
+  },
+  {
+    "tool": "cargo",
+    "message": "unnecessary parentheses around block return value",
+    "location": "src/agent_design/mod.rs:484:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `Component`",
+    "location": "src/commands/artifact/markdown_preview.rs:16:17"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `is_safe_path_segment`",
+    "location": "src/commands/artifact/markdown_preview.rs:20:25"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `Component`",
+    "location": "src/commands/artifact/text_preview.rs:13:17"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `sanitize_project_dir`",
+    "location": "src/commands/online_publish.rs:14:55"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `AppHandle`",
+    "location": "src/settings_flush.rs:10:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused imports: `LedgerError` and `LedgerRecord`",
+    "location": "src/agent_state/mod.rs:11:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `Instant`",
+    "location": "src/agent_design/history_tests.rs:3:27"
+  },
+  {
+    "tool": "cargo",
+    "message": "unnecessary parentheses around `if` condition",
+    "location": "src/tearout/mod.rs:1533:16"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused import: `Manager`",
+    "location": "src/settings_flush.rs:10:24"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused variable: `home`",
+    "location": "src/agent_design/full_content.rs:190:22"
+  },
+  {
+    "tool": "cargo",
+    "message": "type `WindowProof` is more private than the item `manager::SessionManager::create`",
+    "location": "src/pty/manager.rs:158:5"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `apply_repeat_counts_exact` is never used",
+    "location": "src/ailog/query.rs:4047:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "variant `InvalidState` is never constructed",
+    "location": "src/agent_state/ledger.rs:16:5"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `LedgerRecord` is never constructed",
+    "location": "src/agent_state/ledger.rs:39:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "methods `advance_and_reserve`, `record_intent_result`, `acknowledge`, and `load` are never used",
+    "location": "src/agent_state/ledger.rs:106:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `parse_confirmation` is never used",
+    "location": "src/agent_state/ledger.rs:379:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `from_json` is never used",
+    "location": "src/agent_state/ledger.rs:391:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `as_str` is never used",
+    "location": "src/agent_state/model.rs:403:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "field `next_synthetic_turn` is never read",
+    "location": "src/agent_state/reconciler.rs:53:5"
+  },
+  {
+    "tool": "cargo",
+    "message": "methods `issue_synthetic_turn`, `mark_pane_closed`, `canonical_for`, and `advance_time` are never used",
+    "location": "src/agent_state/reconciler.rs:88:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `provisional_deadline` is never used",
+    "location": "src/agent_state/reconciler.rs:390:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `representative_observation` is never used",
+    "location": "src/agent_state/reconciler.rs:401:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "field `enabled` is never read",
+    "location": "src/agent_state/settings.rs:118:9"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `init_for_test` is never used",
+    "location": "src/attention/store.rs:30:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `workorder_observations` is never used",
+    "location": "src/attention/store.rs:376:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `list` is never used",
+    "location": "src/cli_accounts/mod.rs:222:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `capture_account` is never used",
+    "location": "src/cli_accounts/mod.rs:343:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `switch_account` is never used",
+    "location": "src/cli_accounts/mod.rs:464:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `sync_provider` is never used",
+    "location": "src/cli_accounts/live_sync.rs:282:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `wire_name` is never used",
+    "location": "src/cli_accounts/login_watch.rs:57:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "fields `dir`, `mode`, and `started_at` are never read",
+    "location": "src/cli_accounts/login_watch.rs:77:9"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `CliLoginSessionStatus` is never constructed",
+    "location": "src/cli_accounts/login_watch.rs:84:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `list` is never used",
+    "location": "src/cli_accounts/login_watch.rs:154:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `profile_refresh_due` is never used",
+    "location": "src/cli_accounts/token_owner.rs:49:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `opened_document` is never used",
+    "location": "src/agent_design/mod.rs:541:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `meta_cwd` is never used",
+    "location": "src/agent_design/records.rs:115:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `parse_plist` is never used",
+    "location": "src/agent_design/scheduled.rs:96:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `parse_mac` is never used",
+    "location": "src/agent_design/scheduled.rs:140:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "constant `QUIT_PREPARE_EVENT` is never used",
+    "location": "src/commands/quit.rs:22:11"
+  },
+  {
+    "tool": "cargo",
+    "message": "constant `QUIT_SAVE_EVENT` is never used",
+    "location": "src/commands/quit.rs:24:11"
+  },
+  {
+    "tool": "cargo",
+    "message": "constant `PREPARE_TIMEOUT` is never used",
+    "location": "src/commands/quit.rs:26:7"
+  },
+  {
+    "tool": "cargo",
+    "message": "constant `SAVE_TIMEOUT` is never used",
+    "location": "src/commands/quit.rs:27:7"
+  },
+  {
+    "tool": "cargo",
+    "message": "constant `POLL` is never used",
+    "location": "src/commands/quit.rs:28:7"
+  },
+  {
+    "tool": "cargo",
+    "message": "field `running` is never read",
+    "location": "src/commands/quit.rs:32:5"
+  },
+  {
+    "tool": "cargo",
+    "message": "methods `start`, `all_prepared`, and `has_saved` are never used",
+    "location": "src/commands/quit.rs:42:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `wait_until` is never used",
+    "location": "src/commands/quit.rs:87:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `begin_quit` is never used",
+    "location": "src/commands/quit.rs:101:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `running_session_ids` is never used",
+    "location": "src/commands/terminal.rs:101:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `claude_session_path_from_home` is never used",
+    "location": "src/commands/terminal/agent_restore.rs:31:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `metadata_conversation` is never used",
+    "location": "src/commands/terminal/agent_session_guard.rs:75:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `shell_literal` is never used",
+    "location": "src/commands/terminal/codex_restore.rs:359:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `next_child_window_label` is never used",
+    "location": "src/commands/window.rs:219:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "methods `snapshot` and `acknowledge` are never used",
+    "location": "src/settings_flush.rs:47:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `decode_value` is never used",
+    "location": "src/settings_flush.rs:80:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `matches` is never used",
+    "location": "src/settings_flush.rs:98:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `sync_committed_files` is never used",
+    "location": "src/settings_flush.rs:111:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `disk_matches` is never used",
+    "location": "src/settings_flush.rs:148:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `databases` is never used",
+    "location": "src/settings_flush.rs:196:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `wait_for_disk` is never used",
+    "location": "src/settings_flush.rs:224:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `scan` is never used",
+    "location": "src/dispatch/ledger.rs:143:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `deferred` is never used",
+    "location": "src/e2e.rs:258:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `try_ingest_at` is never used",
+    "location": "src/history/mod.rs:19:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `search` is never used",
+    "location": "src/history/mod.rs:23:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `SearchFilters` is never constructed",
+    "location": "src/history/model.rs:56:19"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `Hit` is never constructed",
+    "location": "src/history/model.rs:64:19"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `run` is never used",
+    "location": "src/history/search.rs:5:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `compile_match` is never used",
+    "location": "src/history/search.rs:89:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `search_at` is never used",
+    "location": "src/history/store.rs:53:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `event_count_at` is never used",
+    "location": "src/history/store.rs:63:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `logical_session_count_at` is never used",
+    "location": "src/history/store.rs:68:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `capsules_at` is never used",
+    "location": "src/history/store.rs:77:15"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `reader` is never used",
+    "location": "src/history/store.rs:379:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `parse_json` is never used",
+    "location": "src/history/store.rs:398:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "field `stream_generation` is never read",
+    "location": "src/livebrief/mod.rs:169:5"
+  },
+  {
+    "tool": "cargo",
+    "message": "field `end_offset` is never read",
+    "location": "src/pty/scrollback_store.rs:14:9"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `remove_prefix` is never used",
+    "location": "src/pty/scrollback_store.rs:265:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `run_retention_once_with_before_reprobe` is never used",
+    "location": "src/session_retention.rs:112:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "field `scale` is never read",
+    "location": "src/tearout/geometry.rs:74:64"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `snap_edge_reserved` is never used",
+    "location": "src/tearout/geometry.rs:90:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `ReportEnvelopeId` is never constructed",
+    "location": "src/workorder/model.rs:38:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "associated items `try_new` and `as_str` are never used",
+    "location": "src/workorder/model.rs:14:20"
+  },
+  {
+    "tool": "cargo",
+    "message": "associated function `try_new` is never used",
+    "location": "src/workorder/model.rs:14:20"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `is_terminal` is never used",
+    "location": "src/workorder/model.rs:137:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `as_str` is never used",
+    "location": "src/workorder/model.rs:152:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `as_str` is never used",
+    "location": "src/workorder/model.rs:171:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `WorkOrder` is never constructed",
+    "location": "src/workorder/model.rs:258:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "struct `ReportEnvelope` is never constructed",
+    "location": "src/workorder/model.rs:282:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `as_str` is never used",
+    "location": "src/workorder/model.rs:306:12"
+  },
+  {
+    "tool": "cargo",
+    "message": "variant `Pending` is never constructed",
+    "location": "src/workorder/store.rs:75:5"
+  },
+  {
+    "tool": "cargo",
+    "message": "enum `RecordReportOutcome` is never used",
+    "location": "src/workorder/store.rs:110:10"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `record_report` is never used",
+    "location": "src/workorder/store.rs:639:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `record_gate_result` is never used",
+    "location": "src/workorder/store.rs:715:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `bump_plan_version` is never used",
+    "location": "src/workorder/store.rs:862:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `mark_source_advanced_since_seal` is never used",
+    "location": "src/workorder/store.rs:894:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `maybe_mark_verified` is never used",
+    "location": "src/workorder/store.rs:1124:4"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused variable: `permissions`",
+    "location": "src/claude_skills/startup.rs:313:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "unused variable: `row`",
+    "location": "src/commands/usage.rs:3678:13"
+  },
+  {
+    "tool": "cargo",
+    "message": "function `state_until` is never used",
+    "location": "src/dsh_acp/tests.rs:371:10"
+  },
+  {
+    "tool": "cargo",
+    "message": "method `has_saved` is never used",
+    "location": "src/commands/quit.rs:67:8"
+  },
+  {
+    "tool": "cargo",
+    "message": "`mycmux` (lib) generated 98 warnings (run `cargo fix --lib -p mycmux` to apply 12 suggestions)",
+    "location": null
+  },
+  {
+    "tool": "cargo",
+    "message": "`mycmux` (lib test) generated 34 warnings (25 duplicates) (run `cargo fix --lib -p mycmux --tests` to apply 6 suggestions)",
+    "location": null
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "node_modules/@tauri-apps/api/event.js"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/windowContext.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/settingsStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/focusController.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/ipc.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/sessionAttentionStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/codexRestore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/agents.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/gridTemplates.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/terminal/terminalCache.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/recentInputStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/terminal/terminalTurnModel.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/terminal/terminalTurnMarkers.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/layout/socketCommands.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/layout/tabSweep.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/workspaceStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/workspaceBootstrap.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/tearout/refusal.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "node_modules/@tauri-apps/api/webviewWindow.js"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/tearout/record.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/tearout/runtime.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/dispatchWatchdogStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/askQuestionStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/terminal/XTermWrapper.tsx"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/openWithPaths.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/liveAgentMetadata.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/paneClosePreflight.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/lib/paneCloseOperation.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/stores/savepointDragStore.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/workspace/webPaneApi.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Dynamic and static imports share a chunk",
+    "location": "src/components/terminal/headlessBuffer.ts"
+  },
+  {
+    "tool": "vite",
+    "message": "Generated chunks exceed the 500 kB advisory size",
+    "location": null
+  }
+]

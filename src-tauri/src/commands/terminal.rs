@@ -1,0 +1,2432 @@
+mod agent_restore;
+mod agent_session_guard;
+mod codex_restore;
+use codex_restore::*;
+pub(crate) use codex_restore::{invalidate_codex_restore_notice, publish_codex_restore_epoch};
+pub(crate) fn codex_restore_lifecycle_gate(pty: &str) -> std::sync::Arc<std::sync::Mutex<()>> {
+    codex_restore::creation_gate(pty)
+}
+#[cfg(feature = "e2e")]
+pub(crate) mod codex_restore_harness;
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use tauri::ipc::{Channel, InvokeResponseBody, Response};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+use crate::commands::session_mapping::{is_agent_session_kind, write_session_mapping_file};
+use crate::pty::monitor::PtyMetadata;
+use crate::util::ids::is_uuid_like;
+use crate::AppState;
+
+pub(crate) use agent_restore::can_restore_agent_session;
+use agent_session_guard::{owner_conversation, requested_conversation, Conversation, LaunchClaim, Owner};
+use agent_restore::{
+    ensure_claude_project_trusted, last_claude_effort, validate_agent_restore_request,
+};
+
+#[derive(serde::Serialize)]
+pub struct TerminalConfigPayload {
+    pub font_family: String,
+    pub font_size: f32,
+    pub shell: String,
+    pub background: String,
+    pub foreground: String,
+    pub ansi: Vec<String>,
+    pub windows_build_number: Option<u32>,
+}
+
+fn rgb_hex(c: [u8; 3]) -> String {
+    format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2])
+}
+
+#[cfg(windows)]
+fn windows_build_number() -> Option<u32> {
+    sysinfo::System::kernel_version().and_then(|v| v.parse::<u32>().ok())
+}
+
+#[cfg(not(windows))]
+fn windows_build_number() -> Option<u32> {
+    None
+}
+
+#[tauri::command(async)]
+pub async fn get_terminal_config() -> TerminalConfigPayload {
+    crate::util::task::run_blocking_value("get_terminal_config", move || {
+        let cfg = crate::terminal_config::load();
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
+        TerminalConfigPayload {
+            font_family: cfg.font_family,
+            font_size: cfg.font_size,
+            shell,
+            background: rgb_hex(cfg.colors.background),
+            foreground: rgb_hex(cfg.colors.foreground),
+            ansi: cfg.colors.ansi.iter().map(|c| rgb_hex(*c)).collect(),
+            windows_build_number: windows_build_number(),
+        }
+    }).await
+}
+
+#[tauri::command]
+pub fn get_pty_metadata_snapshot(state: State<'_, AppState>) -> HashMap<String, PtyMetadata> {
+    metadata_snapshot_for(&state.session_manager, &state.metadata_store)
+}
+
+pub(crate) fn metadata_snapshot_for(manager: &crate::pty::manager::SessionManager, metadata_store: &crate::pty::monitor::MetadataStore) -> HashMap<String, PtyMetadata> {
+    manager
+        .iter_pids()
+        .into_iter()
+        .filter(|(id, _)| manager.is_running(id))
+        .filter_map(|(id, _)| {
+            let session = manager.get(&id)?;
+            let epoch = session.session_epoch();
+            let mut metadata = metadata_store
+                .get(&id)
+                .filter(|entry| entry.session_epoch == epoch)
+                .map(|entry| entry.clone())
+                .unwrap_or_else(|| PtyMetadata::unobserved(id.clone()));
+            metadata.session_epoch = epoch;
+            Some((id, metadata))
+        })
+        .collect()
+}
+
+#[tauri::command(async)]
+pub async fn list_running_session_ids(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+    let manager = state.session_manager.clone();
+    crate::util::task::run_blocking("list_running_session_ids", move || Ok(running_session_ids_for(&manager))).await
+}
+
+fn running_session_ids(state: &AppState) -> Vec<String> {
+    running_session_ids_for(&state.session_manager)
+}
+
+fn running_session_ids_for(manager: &crate::pty::manager::SessionManager) -> Vec<String> {
+    manager.iter_pids().into_iter().map(|(id, _)| id)
+        .filter(|id| manager.is_running(id)).collect()
+}
+
+#[tauri::command(async)]
+pub async fn get_agent_conversation_owner(state: State<'_, AppState>, kind: String, agent_session_id: String) -> Result<Option<String>, String> {
+    let manager = state.session_manager.clone();
+    let metadata = state.metadata_store.clone();
+    let request = Conversation::new(&kind, &agent_session_id).ok_or("Invalid conversation")?;
+    crate::util::task::run_blocking("get_agent_conversation_owner", move || {
+        Ok(conversation_owners_for(&manager, &metadata).into_iter()
+            .find(|owner| owner.conversation == request).map(|owner| owner.session_id))
+    }).await
+}
+
+fn running_conversation_owners(state: &AppState) -> Vec<Owner> {
+    conversation_owners_for(&state.session_manager, &state.metadata_store)
+}
+
+// Only PTY roots and descendants need command lines for ownership checks.
+fn owner_commandline_pids(children: &HashMap<sysinfo::Pid, Vec<sysinfo::Pid>>, roots: &[sysinfo::Pid]) -> Vec<sysinfo::Pid> {
+    let mut selected = std::collections::HashSet::new();
+    let mut pending = roots.to_vec();
+    while let Some(pid) = pending.pop() {
+        if !selected.insert(pid) { continue; }
+        if let Some(descendants) = children.get(&pid) {
+            pending.extend(descendants.iter().copied());
+        }
+    }
+    selected.into_iter().collect()
+}
+
+fn conversation_owners_for(manager: &crate::pty::manager::SessionManager, _metadata: &crate::pty::monitor::MetadataStore) -> Vec<Owner> {
+    use crate::pty::monitor::{agent_kind_from_process, build_child_index, find_agent_descendant, session_id_from_agent_args};
+    use sysinfo::{Pid, System, ProcessRefreshKind, ProcessesToUpdate, UpdateKind};
+    let ptys = manager.iter_pids();
+    let mut sys = System::new();
+    // Parent links and creation times are cheap. Reading every Windows command
+    // line can exceed the terminal attach deadline on a busy computer.
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, ProcessRefreshKind::nothing());
+    let roots: Vec<_> = ptys.iter().filter_map(|(_, root)| root.map(Pid::from_u32)).collect();
+    let selected = owner_commandline_pids(&build_child_index(&sys), &roots);
+    if !selected.is_empty() {
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&selected), true,
+            ProcessRefreshKind::nothing().with_cmd(UpdateKind::OnlyIfNotSet));
+    }
+    let children = build_child_index(&sys);
+    let mut owners = Vec::new();
+    for (session_id, root) in ptys {
+        if !manager.is_running(&session_id) { continue; }
+        let agent = root.and_then(|root| find_agent_descendant(&sys, &children, Pid::from_u32(root)));
+        let Some((kind, pid)) = agent else {
+            if let Some((kind, id)) = manager.pending_requested_conversation(&session_id) {
+                if let Some(conversation) = Conversation::new(&kind, &id) {
+                    owners.push(Owner { session_id, conversation, is_running: true });
+                }
+            }
+            continue;
+        };
+        manager.note_agent_seen(&session_id);
+        if !kind.is_restorable() { continue; }
+        let Some(process) = sys.process(pid) else { continue; };
+        let arguments: Vec<_> = process.cmd().iter().map(|v| v.to_string_lossy().into_owned()).collect();
+        if crate::agent_state::is_noninteractive_agent(kind.display_kind(), &arguments) { continue; }
+        let requested = manager.requested_conversation(&session_id)
+            .filter(|(requested_kind, _)| requested_kind == kind.display_kind() || (requested_kind == "claude-codex" && kind.display_kind() == "claude"))
+            .and_then(|(kind, id)| Conversation::new(&kind, &id));
+        let verified_hook = manager.trusted_agent_identity(&session_id)
+            .filter(|identity| identity.from_hook && identity.agent_pid == pid.as_u32()
+                && identity.agent_started_at == process.start_time()
+                && agent_kind_from_process(&sys, pid).is_some_and(|kind| kind.display_kind() == identity.kind
+                    || (kind.display_kind() == "claude" && identity.kind == "claude-codex")))
+            .and_then(|identity| Conversation::new(&identity.kind, &identity.session_id));
+        let effective_kind = requested.as_ref().map(|v| v.kind.as_str()).filter(|value|
+            *value == kind.display_kind() || (*value == "claude-codex" && kind.display_kind() == "claude"))
+            .unwrap_or(kind.display_kind());
+        let argv = session_id_from_agent_args(&sys, pid, kind.display_kind() == "codex")
+            .and_then(|id| Conversation::new(effective_kind, &id));
+        if let Some(conversation) = owner_conversation(true, requested, argv, verified_hook, None, None) {
+            owners.push(Owner { session_id, conversation, is_running: true });
+        }
+    }
+    owners
+}
+
+#[tauri::command(async)]
+pub async fn get_session_output_snapshot(state: State<'_, AppState>) -> Result<HashMap<String, Option<u64>>, String> {
+    Ok(state.session_manager.last_output_snapshot())
+}
+
+// Filesystem, process creation and teardown belong to the blocking pool,
+// keeping both the UI thread and the async workers available for PTY output.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+pub async fn create_session(
+    _trusted: crate::ipc_caller::TrustedAppCaller,
+    caller: tauri::Webview,
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    command: String,
+    args: Vec<String>,
+    cols: u16,
+    rows: u16,
+    on_data: Channel<InvokeResponseBody>,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    background_only: Option<bool>,
+    attach_reason: Option<String>,
+    restore_confirmed: Option<bool>,
+    restore_reason: Option<String>,
+    attachment_context: crate::tearout::attachment_epoch::AttachmentContext,
+) -> Result<crate::tearout::attachment_epoch::AttachmentContext, String> {
+    let attachment_window = crate::tearout::attachment_epoch::window_proof(&caller.window());
+    let reason = match attach_reason.as_deref() {
+        Some("channel-stall" | "write-stall" | "background") => attach_reason.as_deref().unwrap(),
+        _ => "mount",
+    };
+    let attach_origin = format!("window={} reason={reason}", caller.label());
+    // Capture owned handles; borrowed IPC State never crosses the worker boundary.
+    let worker_app = app_handle.clone();
+    let _ = state;
+    crate::util::task::run_blocking("create_session", move || {
+        let state = worker_app.state::<AppState>();
+        create_session_blocking(app_handle, state, session_id, command, args, cols, rows, on_data, cwd, env, background_only.unwrap_or(false), attach_origin, restore_confirmed.unwrap_or(false), restore_reason, |_| Ok(attachment_context), attachment_window)
+    }).await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_session_blocking(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    session_id: String,
+    command: String,
+    args: Vec<String>,
+    cols: u16,
+    rows: u16,
+    on_data: Channel<InvokeResponseBody>,
+    cwd: Option<String>,
+    env: Option<HashMap<String, String>>,
+    background_only: bool,
+    attach_origin: String,
+    restore_confirmed: bool,
+    restore_reason: Option<String>,
+    attachment_context: impl FnOnce(bool) -> Result<crate::tearout::attachment_epoch::AttachmentContext, String>,
+    attachment_window: crate::tearout::attachment_epoch::WindowProof,
+) -> Result<crate::tearout::attachment_epoch::AttachmentContext, String> {
+    crate::perf_timeline::mark("session.create.enter", Some(&session_id));
+    #[cfg(feature = "e2e")]
+    codex_restore_harness::publication_checkpoint(&session_id, "create-enter");
+    let create_gate = codex_restore::creation_gate(&session_id);
+    let creation_guard = create_gate.lock().unwrap_or_else(|e| e.into_inner());
+    let mut requested_command = command;
+    let mut args = args;
+    let mut env_map = env.unwrap_or_default();
+    codex_restore::sanitize_report_env(&mut env_map);
+    validate_terminal_shell_launch(&mut env_map)?;
+    let mut restore_notice = false;
+    let mut cwd = cwd;
+    // A PTY that is still tracked for this session_id means create() below
+    // will take the reattach branch (channel swap only, no spawn / resume).
+    // The resume effort and restore validation only matter for an actual
+    // spawn, so skip both here — otherwise reattaches (e.g. every pane on an
+    // Allotment remount) would read transcripts, re-run stale-id validation
+    // and re-emit "agent-restore-downgraded" for sessions that were never
+    // being restored in the first place.
+    let reattach = state.session_manager.is_alive(&session_id);
+    // Production supplies its IPC-issued context. The e2e adapter issues one
+    // here so its existing pre-gate race checkpoints remain authoritative.
+    let attachment_context = attachment_context(reattach)?;
+    crate::tearout::attachment_epoch::registry().lock().map_err(|e| e.to_string())?
+        .validate(&session_id, &attachment_window, &attachment_context, reattach)?;
+    let codex_restore = !reattach && codex_restore_requested(&requested_command, &args, &env_map, restore_reason.as_deref());
+    let codex_executable = if codex_restore {
+        Some(codex_restore::classify_executable(&requested_command, &args)
+            .ok_or("Unsupported Codex restore executable")?)
+    } else { None };
+    if codex_restore && !env_map.contains_key("MYCMUX_RESUME") {
+        if let Some(id) = codex_restore::exact_resume_id(&requested_command, &args) { env_map.insert("MYCMUX_SESSION_ID".into(), id); }
+        env_map.insert("MYCMUX_RESUME".into(), "codex".into());
+    }
+    let codex_requested_id = codex_restore.then(|| env_map.get("MYCMUX_SESSION_ID").cloned()).flatten();
+    let restore_tab_id = env_map.get("MYCMUX_TAB_ID").filter(|id| is_uuid_like(id)).cloned();
+    let codex_generation = codex_restore.then(|| uuid::Uuid::new_v4().to_string());
+    let mut codex_downgrade_reason = None;
+    let mut codex_report_unavailable = false;
+    if codex_restore { codex_restore_diag(&session_id, restore_tab_id.as_deref(), codex_requested_id.as_deref(), "request", "saved-conversation"); }
+    // Guard before restore recovery, mapping writes, trust writes or spawn.
+    // Keep the claim in scope through every success/error return from create.
+    let _launch_claim = if reattach {
+        None
+    } else if let Some(request) = requested_conversation(&requested_command, &args, &env_map) {
+        match LaunchClaim::acquire(request, &session_id, || running_conversation_owners(&state)) {
+            Ok(claim) => Some(claim),
+            Err(error) => {
+                crate::diag::warn("launch", &error);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    if !reattach && !restore_confirmed {
+        if let Some(request) = requested_conversation(&requested_command, &args, &env_map) {
+            let history = state.session_manager.conversation_history(&session_id);
+            if let Some(choice) = agent_restore::unattended_restore_choice(&request.kind, &request.agent_session_id,
+                cwd.as_deref(), env_map.get("MYCMUX_TAB_ID").map(String::as_str), &history) {
+                return Err(format!("AGENT_RESTORE_CHOICE_REQUIRED:{}", serde_json::to_string(&choice).unwrap()));
+            }
+        }
+    }
+    if codex_restore && codex_restore::clear_codex_restore_report(&session_id).is_err() {
+        codex_report_unavailable = true;
+        codex_restore_diag(&session_id, restore_tab_id.as_deref(), codex_requested_id.as_deref(), "downgrade", "report-unavailable");
+        for id in std::iter::once(session_id.as_str()).chain(restore_tab_id.as_deref()) { let _ = crate::commands::session_mapping::remove_session_mapping_file(id); }
+        for key in ["MYCMUX_RESUME", "MYCMUX_SESSION_ID", "MYCMUX_AGENT_KIND", "MYCMUX_RESUME_FORK", "MYCMUX_LAUNCH_KIND", "MYCMUX_LAUNCH_TARGET"] { env_map.remove(key); }
+        env_map.insert("__CMUX_LAUNCHER_DONE".into(), "1".into());
+        requested_command = codex_restore_report_unavailable_shell(&mut args);
+        if cwd.as_deref().is_some_and(|value| !Path::new(value).is_dir()) { cwd = None; }
+    }
+    if !reattach {
+        inherit_claude_resume_effort(&args, &mut env_map, cwd.as_deref(), last_claude_effort);
+    }
+    if command_leaf(&requested_command).eq_ignore_ascii_case("claude") {
+        normalize_claude_launch_args(&mut args, &env_map);
+    }
+    if codex_restore && !codex_report_unavailable {
+        let validation = validate_agent_restore_request(cwd.as_deref(), &env_map);
+        let reason = match codex_requested_id.as_deref() {
+            None => "missing-id",
+            Some(id) if id.trim().is_empty() => "missing-id",
+            Some(id) if !is_uuid_like(id) => "malformed-id",
+            _ if validation.is_err() || cwd.as_deref().is_some_and(|value| !Path::new(value).is_dir()) => "validation-failed",
+            _ => "exists",
+        };
+        codex_restore_diag(&session_id, restore_tab_id.as_deref(), codex_requested_id.as_deref(), "validation", reason);
+        if reason == "missing-id" {
+            crate::diag::log(&format!("{} guidance=Install the Codex owner hook in Settings to record conversation IDs (owner decision).",
+                codex_restore_diag_line(&session_id, restore_tab_id.as_deref(), None, "guidance", "missing-id")));
+        }
+        if reason != "exists" {
+            codex_downgrade_reason = Some(reason);
+            if let Some(fresh) = codex_executable.as_ref().and_then(|exe| exe.fresh_args()) { args = fresh; }
+            for id in std::iter::once(session_id.as_str()).chain(restore_tab_id.as_deref()) { let _ = crate::commands::session_mapping::remove_session_mapping_file(id); }
+            for key in ["MYCMUX_RESUME", "MYCMUX_SESSION_ID", "MYCMUX_AGENT_KIND", "MYCMUX_RESUME_FORK"] { env_map.remove(key); }
+            if matches!(codex_executable, Some(codex_restore::CodexExecutable::Launcher)) { env_map.insert("MYCMUX_LAUNCH_TARGET".into(), "codex".into()); }
+            if cwd.as_deref().is_some_and(|value| !Path::new(value).is_dir()) { cwd = None; }
+            codex_restore_diag(&session_id, restore_tab_id.as_deref(), codex_requested_id.as_deref(), "downgrade", reason);
+        }
+    }
+    if !reattach && !codex_restore {
+        let validation = validate_agent_restore_request(cwd.as_deref(), &env_map).and_then(|()| {
+            if env_map.get("MYCMUX_RESUME").is_some_and(|kind| kind == "claude")
+                && (env_map.get("MYCMUX_SESSION_ID").is_none_or(|id| id.trim().is_empty())
+                    || cwd.as_deref().is_some_and(|value| !Path::new(value).is_dir()))
+            {
+                Err("Previous Claude session id or working directory is unavailable".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        match validation {
+            Ok(()) => {}
+            Err(err) => {
+                let kind = env_map
+                    .get("MYCMUX_RESUME")
+                    .as_deref()
+                    .filter(|value| is_agent_session_kind(value))
+                    .map(|value| value.to_string());
+                if let Some(kind) = kind.as_deref() {
+                    let requested_session_id = env_map
+                        .get("MYCMUX_SESSION_ID")
+                        .cloned()
+                        .unwrap_or_default();
+                    match apply_agent_restore_recovery_args(
+                        &requested_command,
+                        &mut args,
+                        kind,
+                        &requested_session_id,
+                        &[],
+                        cwd.as_deref(),
+                    ) {
+                        AgentRestoreRecovery::RequestedValid => {}
+                        AgentRestoreRecovery::FreshUnderRequestedId => {
+                            // The env stays as it is: launcher.sh sees the id,
+                            // starts Claude under it and writes the mapping, so
+                            // the pane keeps the identity it was restored with.
+                            crate::diag::log(&format!(
+                                "[restore] {kind} session {requested_session_id} has no transcript yet; starting it under that id"
+                            ));
+                        }
+                        AgentRestoreRecovery::Downgrade => {
+                            eprintln!(
+                                "[mycmux] agent restore validation failed, starting a fresh session: {err}"
+                            );
+                            // Release builds have no stderr, so surface the fresh
+                            // session start to the frontend as a warning toast.
+                            let _ = app_handle.emit(
+                                "agent-restore-downgraded",
+                                serde_json::json!({
+                                    "session_id": &session_id,
+                                    "kind": kind,
+                                    "reason": &err,
+                                }),
+                            );
+                            if matches!(kind, "claude" | "claude-codex") {
+                                restore_notice = true;
+                                if kind == "claude" && !command_leaf(&requested_command).eq_ignore_ascii_case("claude") {
+                                    env_map.insert("MYCMUX_LAUNCH_TARGET".to_string(), "claude".to_string());
+                                }
+                                if cwd.as_deref().is_some_and(|value| !Path::new(value).is_dir()) {
+                                    cwd = None;
+                                }
+                            }
+                            // The pane is about to hold a different
+                            // conversation, so the mapping that still points at
+                            // the one that went missing has to go with it —
+                            // otherwise the monitor keeps writing that id back
+                            // onto the pane and the new session is never
+                            // tracked.
+                            if let Err(error) =
+                                crate::commands::session_mapping::remove_session_mapping_file(
+                                    &session_id,
+                                )
+                            {
+                                crate::diag_warn!(
+                                    "restore",
+                                    "could not drop the mapping for {session_id}: {error}"
+                                );
+                            }
+                            env_map.remove("MYCMUX_SESSION_ID");
+                            env_map.remove("MYCMUX_RESUME");
+                        }
+                    }
+                } else {
+                    env_map.remove("MYCMUX_SESSION_ID");
+                    env_map.remove("MYCMUX_RESUME");
+                }
+            }
+        }
+    }
+    crate::perf_timeline::mark("session.restore.checked", Some(&session_id));
+    let launch_cwd = resolve_launch_cwd(cwd.as_deref());
+    // Stash frontend-provided pane bookkeeping before sanitize_launch_env strips
+    // it; canonical values are re-injected below so launcher.sh session tracking
+    // (__write_session_mapping / __stable_new_session_id) keeps working while
+    // forged values from persistence or parent shells still cannot pass through.
+    let incoming_tab_id = env_map.get("MYCMUX_TAB_ID").cloned();
+    let incoming_launcher_done = env_map
+        .get("__CMUX_LAUNCHER_DONE")
+        .map(|value| value == "1")
+        .unwrap_or(false);
+    sanitize_launch_env(&mut env_map);
+    if let Some(reason) = codex_downgrade_reason { env_map.insert("MYCMUX_CODEX_RESTORE_REASON".into(), reason.into()); }
+    if let Some(generation) = codex_generation.as_ref() { env_map.insert("MYCMUX_CODEX_RESTORE_GENERATION".into(), generation.clone()); }
+    // Canonical MYCMUX_HTML_OUT (HTML sidetab path) for this pane. sanitize_launch_env
+    // just stripped any incoming value, so untrusted env cannot redirect the output.
+    // session_id is used as a single directory segment, so reject anything that
+    // could escape the sessions/ root (path separators or "."/".." components)
+    // before joining — a forged restore id must not be able to redirect the dir.
+    let session_id_is_safe = !session_id.is_empty()
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+        && session_id != "."
+        && session_id != "..";
+    if session_id_is_safe {
+        if let Ok(runtime_dir) = crate::test_profile::runtime_dir() {
+            let html_dir = runtime_dir.join("sessions").join(&session_id);
+            match std::fs::create_dir_all(&html_dir) {
+                Ok(()) => {
+                    let html_path = html_dir.join("out.html");
+                    let markdown_path = html_dir.join("out.md");
+                    let artifacts_dir = html_dir.join("artifacts");
+                    let _ = std::fs::create_dir_all(&artifacts_dir);
+                    env_map.insert(
+                        "MYCMUX_HTML_OUT".to_string(),
+                        html_path.to_string_lossy().to_string(),
+                    );
+                    env_map.insert(
+                        "MYCMUX_MARKDOWN_OUT".to_string(),
+                        markdown_path.to_string_lossy().to_string(),
+                    );
+                    env_map.insert(
+                        "MYCMUX_ARTIFACTS_DIR".to_string(),
+                        artifacts_dir.to_string_lossy().to_string(),
+                    );
+                }
+                Err(err) => {
+                    eprintln!(
+                        "[mycmux] failed to create sidetab dir {}: {err}",
+                        html_dir.display()
+                    );
+                }
+            }
+        }
+    } else {
+        eprintln!("[mycmux] skipping sidetab for unsafe session_id: {session_id:?}");
+    }
+    // Canonical pane/tab identity for launcher.sh session tracking. The pane
+    // session id is the create_session argument itself (the mapping filename
+    // launcher.sh writes under ~/.mycmux/pane-sessions/), so re-injecting it
+    // here cannot be forged — same pattern as MYCMUX_HTML_OUT above.
+    if session_id_is_safe {
+        env_map.insert("MYCMUX_PANE_SESSION_ID".to_string(), session_id.clone());
+    }
+    if let Ok(runtime_dir) = crate::test_profile::runtime_dir() {
+        env_map.insert(
+            "MYCMUX_RUNTIME_DIR".to_string(),
+            runtime_dir.to_string_lossy().to_string(),
+        );
+    }
+    if crate::test_profile::is_active() {
+        env_map.insert("MYCMUX_TEST_PROFILE".to_string(), "1".to_string());
+    }
+    if let Some(tab_id) = incoming_tab_id {
+        if is_uuid_like(&tab_id) {
+            env_map.insert("MYCMUX_TAB_ID".to_string(), tab_id);
+        }
+    }
+    if incoming_launcher_done {
+        env_map.insert("__CMUX_LAUNCHER_DONE".to_string(), "1".to_string());
+    }
+    // macOS hands a Finder/Dock-launched app launchd's PATH, which holds none
+    // of the agents. See `commands::shell::login_shell_path`.
+    #[cfg(target_os = "macos")]
+    if !env_map.contains_key("PATH") {
+        if let Some(path) = crate::commands::shell::login_shell_path(&app_handle) {
+            env_map.insert("PATH".to_string(), path.to_string());
+        }
+    }
+    let command = prepare_spawn_command(&requested_command, &mut args);
+    if let Some(kind) = launch_kind_for_agent(&requested_command, &args) {
+        env_map.insert("MYCMUX_LAUNCH_KIND".to_string(), kind.to_string());
+    }
+    // A launcher pane that starts the plain shell instead of the launcher looks
+    // identical on screen to one whose CLI exited instantly, and the frontend
+    // decides the command, so record what was actually spawned: it is the one
+    // line that separates "the launcher never ran" from "the CLI failed".
+    if let Some(target) = env_map.get("MYCMUX_LAUNCH_TARGET") {
+        if codex_restore && target == "codex" { codex_restore_diag(&session_id, restore_tab_id.as_deref(), codex_requested_id.as_deref(), "dispatch", "launcher"); }
+        else { crate::diag::warn(
+            "launch",
+            &format!("target={target} command={command} args={args:?}"),
+        ); }
+    }
+    inject_osc7_hook(&command, &mut args, &mut env_map);
+    inject_no_color_for_agy(&command, &mut env_map);
+    if should_trust_claude_workspace(&requested_command, &env_map) {
+        if let Some(trusted_cwd) = launch_cwd.as_deref() {
+            if let Err(error) = ensure_claude_project_trusted(trusted_cwd) {
+                eprintln!("[claude] failed to mark workspace trusted: {error}");
+            }
+        }
+    }
+    write_launch_session_mapping(&session_id, &env_map);
+    // Explicit argv resumes need an identity immediately too: the monitor may
+    // not have observed this new PTY when a subsequent create checks owners.
+    if !reattach && !env_map.contains_key("MYCMUX_SESSION_ID") {
+        if let Some(request) = requested_conversation(&requested_command, &args, &env_map) {
+            write_session_mapping_file(&session_id, &request.kind, &request.agent_session_id)?;
+        }
+    }
+    let command = if let Some(mut fresh_args) = codex_executable.as_ref().filter(|_| !codex_report_unavailable).and_then(|exe| exe.fresh_args()) {
+        let fresh_command = prepare_spawn_command(&requested_command, &mut fresh_args);
+        wrap_codex_restore(&command, &mut args, &fresh_command, &fresh_args)
+    } else if restore_notice {
+        wrap_restore_notice(&command, &mut args)
+    } else {
+        command
+    };
+    let launch_conversation = requested_conversation(&requested_command, &args, &env_map);
+    #[cfg(feature = "e2e")]
+    codex_restore_harness::capture_launch(&session_id, &command, &args, &env_map);
+    invalidate_codex_restore_notice(&app_handle, &session_id);
+    let created = state.session_manager.create(
+        session_id.clone(),
+        &command,
+        &args,
+        cols,
+        rows,
+        on_data,
+        || app_handle.clone(),
+        launch_cwd,
+        Some(env_map),
+        state.metadata_store.clone(),
+        state.scrollback_dir.get().map(PathBuf::as_path),
+        background_only,
+        &attach_origin,
+        &attachment_context,
+        &attachment_window,
+    );
+    if codex_restore && created.is_err() { codex_restore_diag(&session_id, restore_tab_id.as_deref(), codex_requested_id.as_deref(), "spawn-failure", "pty-spawn-failed"); }
+    created?;
+    if !reattach {
+        if let Some(request) = launch_conversation {
+            state.session_manager.remember_requested_conversation(&session_id, &request.kind, &request.agent_session_id);
+        }
+    }
+    // Create, kill and attachment share this gate through publication.
+    // Release before report registration/delivery.
+    let active_epoch = state.session_manager.session_observation(&session_id).map(|value| value.0);
+    let codex_epoch = (!reattach && codex_restore).then_some(active_epoch).flatten();
+    #[cfg(feature = "e2e")]
+    codex_restore_harness::publication_checkpoint(&session_id, "create-publish");
+    publish_codex_restore_epoch(&app_handle, &session_id, active_epoch);
+    drop(creation_guard);
+    #[cfg(feature = "e2e")]
+    codex_restore_harness::after_native_create(&session_id, codex_generation.as_deref());
+    if !reattach && codex_restore {
+        if let (Some(epoch), Some(generation)) = (codex_epoch, codex_generation) {
+            let context = codex_restore::RestoreReportContext::new(epoch, generation, restore_tab_id, codex_requested_id);
+            if codex_report_unavailable {
+                codex_restore::emit_notice(&app_handle, &session_id, &context, "report-unavailable");
+            } else {
+                codex_restore::watch_report(app_handle.clone(), state.session_manager.clone(), session_id.clone(), context);
+            }
+        }
+    }
+    crate::perf_timeline::mark("session.create.done", Some(&session_id));
+    if let Some((session_epoch, _)) = state.session_manager.session_observation(&session_id) {
+        state.session_state_store.ingest(
+            session_id,
+            crate::session_state::Evidence::socket_lifecycle(
+                crate::session_state::unix_epoch_millis(),
+                session_epoch,
+                crate::session_state::Lifecycle::Alive,
+            ),
+        );
+    }
+    Ok(attachment_context)
+}
+
+// Notification freshness only; not an identity/save reader or authority.
+#[tauri::command(async)]
+pub async fn get_codex_restore_epoch(state: State<'_, AppState>, session_id: String) -> Result<Option<u64>, String> {
+    let manager = state.session_manager.clone();
+    crate::util::task::run_blocking("codex_restore_epoch", move || {
+        #[cfg(feature = "e2e")]
+        codex_restore_harness::publication_checkpoint(&session_id, "epoch-enter");
+        let gate = codex_restore_lifecycle_gate(&session_id);
+        let _guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(manager.session_observation(&session_id).map(|value| value.0))
+    }).await
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn prepare_spawn_command(command: &str, args: &mut Vec<String>) -> String {
+    let Some(resolved) = resolve_windows_command(command) else {
+        return command.to_string();
+    };
+    let extension = resolved
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if extension == "cmd" || extension == "bat" {
+        let script = resolved.to_string_lossy().to_string();
+        let mut wrapped_args = vec!["/d".to_string(), "/c".to_string(), script];
+        wrapped_args.append(args);
+        *args = wrapped_args;
+        return std::env::var("COMSPEC")
+            .unwrap_or_else(|_| "C:\\Windows\\System32\\cmd.exe".to_string());
+    }
+    let resolved_command = resolved.to_string_lossy().to_string();
+    force_utf8_codepage_for_interactive_shell(&resolved_command, args);
+    resolved_command
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn prepare_spawn_command(command: &str, _args: &mut Vec<String>) -> String {
+    command.to_string()
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_command(command: &str) -> Option<std::path::PathBuf> {
+    let command_path = Path::new(command);
+    let has_separator = command.contains(['/', '\\']);
+    if has_separator {
+        return resolve_windows_command_candidate(command_path);
+    }
+
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        if let Some(resolved) = resolve_windows_command_candidate(&dir.join(command)) {
+            return Some(resolved);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_windows_command_candidate(path: &Path) -> Option<std::path::PathBuf> {
+    if path.extension().is_some() && path.is_file() {
+        return Some(path.to_path_buf());
+    }
+
+    for extension in ["cmd", "exe", "bat", "com"] {
+        let candidate = path.with_extension(extension);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "windows")]
+fn force_utf8_codepage_for_interactive_shell(command: &str, args: &mut Vec<String>) {
+    let leaf = Path::new(command)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(command)
+        .to_ascii_lowercase();
+    match leaf.as_str() {
+        "bash" | "sh" if args.is_empty() || args.as_slice() == ["-i"] => {
+            let executable = leaf;
+            *args = vec![
+                "-c".to_string(),
+                format!("chcp.com 65001 >/dev/null 2>&1; exec {executable} -i"),
+            ];
+        }
+        "bash" | "sh" => {
+            if let Some(command_index) = args.iter().position(|arg| arg == "-c") {
+                if let Some(script) = args.get_mut(command_index + 1) {
+                    if !script.contains("chcp.com 65001") {
+                        *script = format!("chcp.com 65001 >/dev/null 2>&1; {script}");
+                    }
+                }
+            }
+        }
+        "powershell" | "pwsh" if args.is_empty() => {
+            *args = vec![
+                "-NoExit".to_string(),
+                "-Command".to_string(),
+                "chcp.com 65001 > $null; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding; [Console]::InputEncoding = New-Object System.Text.UTF8Encoding".to_string(),
+            ];
+        }
+        "cmd" if args.is_empty() => {
+            *args = vec![
+                "/d".to_string(),
+                "/k".to_string(),
+                "chcp.com 65001 >nul".to_string(),
+            ];
+        }
+        _ => {}
+    }
+}
+
+fn command_leaf(command: &str) -> &str {
+    let leaf = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    leaf.strip_suffix(".exe")
+        .or_else(|| leaf.strip_suffix(".cmd"))
+        .or_else(|| leaf.strip_suffix(".bat"))
+        .or_else(|| leaf.strip_suffix(".com"))
+        .unwrap_or(leaf)
+}
+
+fn launch_kind_for_agent(command: &str, args: &[String]) -> Option<&'static str> {
+    let leaf = command_leaf(command);
+    let is_resume = match leaf.to_ascii_lowercase().as_str() {
+        "claude" | "claude-codex" | "grok" => args.iter().any(|arg| {
+            matches!(arg.as_str(), "--resume" | "--continue")
+                || arg.starts_with("--resume=")
+        }),
+        "codex" => args.iter().any(|arg| arg == "resume"),
+        _ => return None,
+    };
+    Some(if is_resume { "resume" } else { "new" })
+}
+
+// Keep explicit saved values, without supplying a model or effort default.
+fn claude_launch_spec_args(args: &[String]) -> Vec<String> {
+    let mut values = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if matches!(arg.as_str(), "--model" | "--effort") {
+            if let Some(value) = iter.next() {
+                values.extend([arg.clone(), value.clone()]);
+            }
+        } else if arg.starts_with("--model=") || arg.starts_with("--effort=") {
+            values.push(arg.clone());
+        }
+    }
+    values
+}
+
+/// A model or effort value is only put on a command line when it cannot be
+/// read as a flag or as shell syntax: an alphanumeric first byte, then
+/// `A-Za-z0-9._/-`, at most 128 bytes. `/` is allowed because claude-codex
+/// names an OpenRouter model by its gateway picker id
+/// (`anthropic/gateway/fcc/open_router/x-ai/grok-4.3`); it is not special to
+/// either shell. Mirrors `LAUNCH_SPEC_VALUE` in src/lib/agentCatalog.ts,
+/// `Get-MycmuxLaunchSpecValue` in launcher.ps1 and `__launch_spec_value` in
+/// launcher.sh.
+pub(crate) fn is_launch_spec_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.as_bytes()[0].is_ascii_alphanumeric()
+        && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"._/-".contains(&byte))
+}
+
+/// Launch targets are fixed identifiers, never user command text.
+fn validate_terminal_shell_launch(env: &mut HashMap<String, String>) -> Result<(), String> {
+    env.retain(|key, _| !["MYCMUX_LAUNCH_TARGET", "MYCMUX_LAUNCH_COMMAND"].iter()
+        .any(|canonical| key != *canonical && key.eq_ignore_ascii_case(canonical)));
+    if let Some(target) = env.get("MYCMUX_LAUNCH_TARGET") {
+        if !matches!(target.as_str(), "shell" | "claude" | "codex" | "claude-codex" | "grok"
+            | "hermes" | "omp" | "cursor" | "agy" | "gemini" | "antigravity" | "aider"
+            | "claude-resume" | "codex-resume" | "claude-codex-resume" | "grok-resume"
+            | "claude-codex-open" | "fcc" | "fcc-claude" | "custom" | "chatgpt"
+            | "web-chatgpt" | "web-gemini" | "gemini-web" | "web-grok" | "grok-web"
+            | "web-claude" | "claude-web" | "claude-ai" | "web-notebooklm" | "notebooklm"
+            | "web-browser" | "web-dots" | "app-grokbot") {
+            return Err("Invalid launcher target".into());
+        }
+    }
+    if let Some(command) = env.get("MYCMUX_LAUNCH_COMMAND") {
+        if env.get("MYCMUX_LAUNCH_TARGET").map(String::as_str) != Some("shell")
+            || command.trim().is_empty() || command.encode_utf16().count() > 4096
+            || command.chars().any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')) {
+            // Never include the command in an error or diagnostic.
+            return Err("Terminal command must be one line of at most 4096 characters".into());
+        }
+    }
+    Ok(())
+}
+
+fn normalize_claude_launch_args(args: &mut Vec<String>, env: &HashMap<String, String>) {
+    let mut normalized = Vec::new();
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--permission-mode" => { iter.next(); }
+            "--dangerously-skip-permissions" | "--allow-dangerously-skip-permissions" => {}
+            _ if arg.starts_with("--permission-mode=") => {}
+            _ => normalized.push(arg.clone()),
+        }
+    }
+    normalized.extend([
+        "--allow-dangerously-skip-permissions".to_string(),
+        "--permission-mode".to_string(),
+        "auto".to_string(),
+    ]);
+    for (key, flag) in [("MYCMUX_LAUNCH_MODEL", "--model"), ("MYCMUX_LAUNCH_EFFORT", "--effort")] {
+        let Some(value) = env.get(key).map(|value| value.trim()).filter(|value| is_launch_spec_value(value))
+        else { continue };
+        if !normalized.iter().any(|arg| arg == flag || arg.starts_with(&format!("{flag}="))) {
+            normalized.extend([flag.to_string(), value.to_string()]);
+        }
+    }
+    *args = normalized;
+}
+
+/// A restored Claude pane resumes at the effort its conversation last ran at.
+///
+/// Claude Code brings the model back from the transcript on `--resume` but
+/// takes the effort from the shared settings default, and `/effort max` is
+/// never saved there, so a pane that ran at `max` would come back at the
+/// default. The level read from the transcript goes into
+/// `MYCMUX_LAUNCH_EFFORT`, which `normalize_claude_launch_args` (direct
+/// launch) and launcher.ps1 / launcher.sh (launcher resume) already turn into
+/// `--effort`. Only a Claude
+/// resume is looked at, and an effort the caller chose, in the env or on the
+/// command line, is left alone. `lookup` is `last_claude_effort` outside
+/// tests.
+fn inherit_claude_resume_effort<F>(
+    args: &[String],
+    env: &mut HashMap<String, String>,
+    cwd: Option<&str>,
+    lookup: F,
+) where
+    F: FnOnce(Option<&str>, &str) -> Option<String>,
+{
+    if env.get("MYCMUX_RESUME").map(String::as_str) != Some("claude") {
+        return;
+    }
+    let effort_in_env = env
+        .get("MYCMUX_LAUNCH_EFFORT")
+        .is_some_and(|value| !value.trim().is_empty());
+    let effort_in_args = args
+        .iter()
+        .any(|arg| arg == "--effort" || arg.starts_with("--effort="));
+    if effort_in_env || effort_in_args {
+        return;
+    }
+    let Some(session_id) = env
+        .get("MYCMUX_SESSION_ID")
+        .filter(|id| is_uuid_like(id))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(effort) = lookup(cwd, &session_id) else {
+        return;
+    };
+    crate::diag::log(&format!(
+        "[restore] claude session {session_id} resumes at effort {effort} (last reply in transcript)"
+    ));
+    env.insert("MYCMUX_LAUNCH_EFFORT".to_string(), effort);
+}
+
+// Print through the PTY itself, so release builds and terminal scrollback retain
+// the warning. Arguments stay separate from shell code (literal-quoted on Windows).
+fn wrap_restore_notice(command: &str, args: &mut Vec<String>) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let quote = |value: &str| format!("'{}'", value.replace('\'', "''"));
+        let invocation = std::iter::once(command).chain(args.iter().map(String::as_str))
+            .map(quote).collect::<Vec<_>>().join(" ");
+        *args = vec!["-NoLogo".into(), "-NoProfile".into(), "-Command".into(), format!(
+            "Write-Host '  Previous conversation could not be restored; starting a new session.'; & {invocation}; exit $LASTEXITCODE"
+        )];
+        "powershell.exe".to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut wrapped = vec![
+            "-c".to_string(),
+            "printf '%s\\n' '  Previous conversation could not be restored; starting a new session.'; exec \"$@\"".to_string(),
+            "mycmux-restore".to_string(), command.to_string(),
+        ];
+        wrapped.append(args);
+        *args = wrapped;
+        "/bin/sh".to_string()
+    }
+}
+
+fn apply_agent_restore_fallback_args(command: &str, args: &mut Vec<String>, kind: &str) {
+    let leaf = command_leaf(command).to_ascii_lowercase();
+    match (leaf.as_str(), kind) {
+        ("claude", "claude") => {
+            let launch_spec = claude_launch_spec_args(args);
+            *args = vec![
+                "--allow-dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "auto".to_string(),
+            ];
+            args.extend(launch_spec);
+        }
+        ("codex", "codex") => {
+            *args = vec!["--no-alt-screen".to_string()];
+        }
+        ("claude-codex", "claude-codex") => *args = Vec::new(),
+        ("grok", "grok") => {
+            *args = vec!["--no-alt-screen".to_string()];
+        }
+        _ => {}
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AgentRestoreRecovery {
+    RequestedValid,
+    /// Nothing was ever written under the saved id, so there is no
+    /// conversation to lose: start a new one under that same id.
+    FreshUnderRequestedId,
+    Downgrade,
+}
+
+fn apply_agent_restore_recovery_args(
+    command: &str,
+    args: &mut Vec<String>,
+    kind: &str,
+    requested_session_id: &str,
+    _fallback_session_ids: &[String],
+    cwd: Option<&str>,
+) -> AgentRestoreRecovery {
+    apply_agent_restore_recovery_args_with(
+        command,
+        args,
+        kind,
+        requested_session_id,
+        _fallback_session_ids,
+        cwd,
+        |kind, session_id, cwd| {
+            !(kind == "claude" && (session_id.trim().is_empty()
+                || cwd.is_some_and(|value| !Path::new(value).is_dir())))
+                && can_restore_agent_session(kind, session_id, cwd)
+        },
+    )
+}
+
+fn apply_agent_restore_recovery_args_with<F>(
+    command: &str,
+    args: &mut Vec<String>,
+    kind: &str,
+    requested_session_id: &str,
+    _fallback_session_ids: &[String],
+    cwd: Option<&str>,
+    mut can_restore: F,
+) -> AgentRestoreRecovery
+where
+    F: FnMut(&str, &str, Option<&str>) -> bool,
+{
+    if can_restore(kind, requested_session_id, cwd) {
+        return AgentRestoreRecovery::RequestedValid;
+    }
+    // A Claude pane that was never typed into has no transcript anywhere —
+    // which is exactly why the check above failed. Starting a fresh session
+    // with a *new* id used to strand it: the tab and the launcher mapping kept
+    // pointing at the id nobody would ever write, so the conversation the user
+    // then had was never tracked and every restart said it could not be
+    // restored. Claude takes `--session-id`, so the pane can simply start
+    // under the id it was already carrying.
+    if kind == "claude"
+        && is_uuid_like(requested_session_id)
+        && cwd.is_some_and(|value| Path::new(value).is_dir())
+    {
+        apply_claude_pinned_id_args(command, args, requested_session_id);
+        return AgentRestoreRecovery::FreshUnderRequestedId;
+    }
+    apply_agent_restore_fallback_args(command, args, kind);
+    AgentRestoreRecovery::Downgrade
+}
+
+/// Start Claude under a given id rather than resuming it.
+///
+/// Only meaningful when the command is Claude itself; a launcher command
+/// (`bash -i -c …`) keeps its arguments and decides inside the script, which is
+/// where it can also write the pane mapping.
+fn apply_claude_pinned_id_args(command: &str, args: &mut Vec<String>, session_id: &str) {
+    if !command_leaf(command).eq_ignore_ascii_case("claude") {
+        return;
+    }
+    let launch_spec = claude_launch_spec_args(args);
+    *args = vec![
+        "--allow-dangerously-skip-permissions".to_string(),
+        "--permission-mode".to_string(),
+        "auto".to_string(),
+        "--session-id".to_string(),
+        session_id.to_string(),
+    ];
+    args.extend(launch_spec);
+}
+
+fn should_trust_claude_workspace(command: &str, env: &HashMap<String, String>) -> bool {
+    // A pane launched with CLAUDE_CONFIG_DIR reads its config from the staging
+    // directory. Writing trust into the live ~/.claude.json has no effect there
+    // and only rewrites the file, which makes live_sync re-capture for nothing.
+    if env.contains_key("CLAUDE_CONFIG_DIR") {
+        return false;
+    }
+    let kind = env
+        .get("MYCMUX_AGENT_KIND")
+        .or_else(|| env.get("MYCMUX_RESUME"))
+        .map(|value| value.as_str());
+    kind == Some("claude") || command_leaf(command).eq_ignore_ascii_case("claude")
+}
+
+pub(crate) fn resolve_launch_cwd(cwd: Option<&str>) -> Option<String> {
+    if let Some(value) = cwd.filter(|value| !value.trim().is_empty()) {
+        return Some(value.to_string());
+    }
+    dirs::home_dir().map(|path| path.to_string_lossy().to_string())
+}
+
+/// Last-line defense against MYCMUX_* env pollution leaking into a freshly
+/// spawned PTY child.
+///
+/// `validate_agent_restore_request` only rejects *invalid* resume payloads — it
+/// will happily pass through `MYCMUX_RESUME=1` on its own (no MYCMUX_SESSION_ID),
+/// or stray `MYCMUX_PANE_SESSION_ID` / `__CMUX_LAUNCHER_DONE` left over from
+/// persistence or parent shells. Any of those reaching the child triggers
+/// unintended agent auto-resume / kind detection.
+///
+/// Strategy:
+///   - If the payload looks like a *legitimate* resume (`MYCMUX_SESSION_ID` +
+///     a recognized kind in `MYCMUX_RESUME` / `MYCMUX_AGENT_KIND`) or a
+///     legitimate handoff (`MYCMUX_HANDOFF` + `MYCMUX_HANDOFF_FROM_SESSION`),
+///     keep the resume / handoff payload and only strip pane-internal bookkeeping
+///     (`MYCMUX_PANE_SESSION_ID`, `MYCMUX_TAB_ID`, `__CMUX_LAUNCHER_DONE`).
+///   - Otherwise strip *every* MYCMUX_* and `__CMUX_LAUNCHER_DONE`.
+///
+/// Pane bookkeeping is stripped here but `create_session` re-injects canonical
+/// values afterwards (`MYCMUX_PANE_SESSION_ID` = the session_id argument,
+/// `MYCMUX_TAB_ID` = the frontend value when UUID-shaped, `__CMUX_LAUNCHER_DONE`
+/// when the frontend explicitly sent "1") — launcher.sh session tracking
+/// depends on them.
+///
+/// Keep this list in sync with `lib.rs::run()` startup `remove_var` and the
+/// frontend `EPHEMERAL_LAUNCH_ENV_KEYS` set in `SocketListener.tsx`.
+pub(crate) fn sanitize_launch_env(env: &mut HashMap<String, String>) {
+    const ALWAYS_INTERNAL: &[&str] = &[
+        "MYCMUX_PANE_SESSION_ID",
+        "MYCMUX_TAB_ID",
+        "__CMUX_LAUNCHER_DONE",
+        // Always stripped so frontend/parent-shell cannot forge a path. The
+        // canonical absolute value is re-injected by create_session below.
+        "MYCMUX_HTML_OUT",
+        "MYCMUX_MARKDOWN_OUT",
+        "MYCMUX_ARTIFACTS_DIR",
+        "MYCMUX_RUNTIME_DIR",
+        "MYCMUX_TEST_PROFILE",
+        "MYCMUX_HOOK_CAP",
+        "MYCMUX_LAUNCH_KIND",
+    ];
+    const RESUME_QUARTET: &[&str] = &[
+        "MYCMUX_RESUME",
+        "MYCMUX_SESSION_ID",
+        "MYCMUX_AGENT_KIND",
+        "MYCMUX_RESUME_FORK",
+    ];
+    const HANDOFF_QUARTET: &[&str] = &[
+        "MYCMUX_HANDOFF",
+        "MYCMUX_HANDOFF_FROM",
+        "MYCMUX_HANDOFF_PROMPT_FILE",
+        "MYCMUX_HANDOFF_FROM_SESSION",
+        "MYCMUX_HANDOFF_LAUNCH_KIND",
+    ];
+
+    // Windows environment names are case-insensitive. Keep canonical keys for
+    // the existing legitimacy checks below, but strip every case alias before
+    // handing the map to portable-pty where aliases would otherwise merge.
+    env.retain(|key, _| {
+        !ALWAYS_INTERNAL
+            .iter()
+            .chain(RESUME_QUARTET.iter())
+            .chain(HANDOFF_QUARTET.iter())
+            .any(|protected| key != *protected && key.eq_ignore_ascii_case(protected))
+    });
+
+    let has_session = env
+        .get("MYCMUX_SESSION_ID")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let resume_kind = env
+        .get("MYCMUX_RESUME")
+        .or_else(|| env.get("MYCMUX_AGENT_KIND"))
+        .map(|v| v.as_str());
+    let has_kind = resume_kind.map(is_agent_session_kind).unwrap_or(false);
+    let supports_resume_fork = matches!(resume_kind, Some("claude" | "claude-codex" | "grok"));
+    let legitimate_resume = has_session && has_kind;
+
+    let has_handoff = env
+        .get("MYCMUX_HANDOFF")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let has_handoff_from = env
+        .get("MYCMUX_HANDOFF_FROM_SESSION")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    let legitimate_handoff = has_handoff && has_handoff_from;
+
+    for key in ALWAYS_INTERNAL {
+        env.remove(*key);
+    }
+    if !legitimate_resume {
+        for key in RESUME_QUARTET {
+            env.remove(*key);
+        }
+    } else if !supports_resume_fork {
+        env.remove("MYCMUX_RESUME_FORK");
+    }
+    if !legitimate_handoff {
+        for key in HANDOFF_QUARTET {
+            env.remove(*key);
+        }
+    }
+}
+
+fn write_launch_session_mapping(session_id: &str, env: &HashMap<String, String>) {
+    let Some(agent_session_id) = env
+        .get("MYCMUX_SESSION_ID")
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let Some(agent_kind) = env
+        .get("MYCMUX_AGENT_KIND")
+        .or_else(|| env.get("MYCMUX_RESUME"))
+        .map(|value| value.as_str())
+        .filter(|value| is_agent_session_kind(value))
+    else {
+        return;
+    };
+    if matches!(agent_kind, "claude" | "claude-codex" | "grok")
+        && env
+            .get("MYCMUX_RESUME_FORK")
+            .map(|value| value == "1")
+            .unwrap_or(false)
+    {
+        return;
+    }
+    let _ = write_session_mapping_file(session_id, agent_kind, agent_session_id);
+}
+
+/// Inject a shell-specific OSC 7 emission hook so the PTY reader can observe
+/// CWD changes immediately. Silent no-op for shells we don't know how to hook
+/// (PowerShell, cmd.exe, zsh for now) — sysinfo monitor remains the fallback.
+fn inject_osc7_hook(command: &str, args: &mut Vec<String>, env: &mut HashMap<String, String>) {
+    // Allow the frontend to opt out at spawn time by setting MYCMUX_OSC7=0.
+    if env.get("MYCMUX_OSC7").map(|v| v == "0").unwrap_or(false) {
+        return;
+    }
+    let lower = command.to_ascii_lowercase();
+    let leaf = lower.rsplit(['/', '\\']).next().unwrap_or("");
+    let shell = leaf.strip_suffix(".exe").unwrap_or(leaf);
+
+    match shell {
+        "bash" | "sh" => {
+            let hook = r#"printf '\e]7;file://%s%s\a' "${HOSTNAME:-localhost}" "$PWD""#;
+            let existing = env.get("PROMPT_COMMAND").cloned().unwrap_or_default();
+            let combined = if existing.is_empty() {
+                hook.to_string()
+            } else {
+                // Run the hook after user's PROMPT_COMMAND so their exit
+                // status logic is preserved.
+                format!("{};{}", existing, hook)
+            };
+            env.insert("PROMPT_COMMAND".into(), combined);
+        }
+        "fish" => {
+            let init = r#"function __mycmux_osc7 --on-event fish_prompt; printf '\e]7;file://%s%s\a' (hostname) $PWD; end"#;
+            args.insert(0, "--init-command".into());
+            args.insert(1, init.into());
+        }
+        // zsh: needs ZDOTDIR override + precmd hook; deferred.
+        // pwsh / powershell / cmd: no OSC 7 equivalent; sysinfo handles them.
+        _ => {}
+    }
+}
+
+/// agy (Antigravity CLI) hardcodes light-background ANSI/256-color escapes and
+/// never queries the terminal background (OSC 11); mycmux's 16-color ANSI theme
+/// cannot patch the truecolor/256-color output it emits directly, and agy has no
+/// --theme/--no-color flag (confirmed on agy 1.1.11). NO_COLOR=1 is the only known
+/// mitigation. This only covers panes whose own top-level command IS the agent
+/// binary (e.g. a BUILT_IN_AGENTS direct launch such as `command: "gemini"` in
+/// src/lib/agents.ts) — panes that reach agy via launcher.sh/launcher.ps1's own
+/// menu are handled inside those scripts instead, since Rust never sees the
+/// inner `eval`'d command.
+fn inject_no_color_for_agy(command: &str, env: &mut HashMap<String, String>) {
+    let leaf = command_leaf(command).to_ascii_lowercase();
+    if matches!(leaf.as_str(), "agy" | "antigravity" | "gemini") {
+        env.entry("NO_COLOR".to_string())
+            .or_insert_with(|| "1".to_string());
+    }
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardedWriteResult {
+    sent: bool,
+    reason: Option<&'static str>,
+}
+
+#[tauri::command]
+pub fn write_to_session(
+    _trusted: crate::ipc_caller::TrustedAppCaller,
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+) -> Result<(), String> {
+    state.session_manager.write(&session_id, data.as_bytes())
+}
+
+#[tauri::command(async)]
+pub async fn get_session_input_revision(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<u64, String> {
+    state.session_manager.input_revision(&session_id)
+}
+
+#[tauri::command(async)]
+pub async fn write_to_session_guarded(
+    _trusted: crate::ipc_caller::TrustedAppCaller,
+    state: State<'_, AppState>,
+    session_id: String,
+    data: String,
+    expected_attention_id: Option<String>,
+    expected_session_epoch: u64,
+    expected_session_revision: u64,
+    expected_input_revision: u64,
+) -> Result<GuardedWriteResult, String> {
+    let guarded_write = state
+        .session_state_store
+        .with_current_view(&session_id, |current| {
+            if current.attention.attention_id.as_ref() != expected_attention_id.as_ref() {
+                return Ok(Err("attention_id"));
+            }
+            if current.session_epoch != Some(expected_session_epoch) {
+                return Ok(Err("session_epoch"));
+            }
+            if current.session_revision != expected_session_revision {
+                return Ok(Err("session_revision"));
+            }
+            state
+                .session_manager
+                .write_intervention_if_revision(
+                    &session_id,
+                    Some(expected_session_epoch),
+                    expected_input_revision,
+                    data.as_bytes(),
+                )
+                .map(Ok)
+        });
+    let receiver = match guarded_write {
+        None => {
+            return Ok(GuardedWriteResult {
+                sent: false,
+                reason: Some("unknown_session"),
+            });
+        }
+        Some(Ok(Err(reason))) => {
+            return Ok(GuardedWriteResult {
+                sent: false,
+                reason: Some(reason),
+            });
+        }
+        Some(Ok(Ok(receiver))) => receiver,
+        Some(Err(error)) if error.starts_with("PTY_INPUT_REVISION_CONFLICT:") => {
+            return Ok(GuardedWriteResult {
+                sent: false,
+                reason: Some("input_revision"),
+            });
+        }
+        Some(Err(error)) if error.starts_with("PTY_SESSION_EPOCH_CONFLICT:") => {
+            return Ok(GuardedWriteResult {
+                sent: false,
+                reason: Some("session_epoch"),
+            });
+        }
+        Some(Err(error)) => return Err(error),
+    };
+    let write_result = tauri::async_runtime::spawn_blocking(move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(10))
+    })
+        .await
+        .map_err(|error| format!("PTY_INPUT_WRITER_FAILED: {error}"))?
+        .map_err(|error| format!("PTY_INPUT_WRITER_FAILED: writer completion unavailable: {error}"))?;
+    write_result?;
+    Ok(GuardedWriteResult {
+        sent: true,
+        reason: None,
+    })
+}
+
+#[tauri::command(async)]
+pub async fn is_session_alive(state: State<'_, AppState>, session_id: String) -> Result<bool, String> {
+    Ok(state.session_manager.is_alive(&session_id))
+}
+
+#[tauri::command(async)]
+pub async fn resize_session(
+    state: State<'_, AppState>,
+    session_id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    let manager = state.session_manager.clone();
+    crate::util::task::run_blocking("resize_session", move || {
+        manager.resize(&session_id, cols, rows)
+    }).await
+}
+
+#[tauri::command]
+pub fn ack_frontend_data(
+    state: State<'_, AppState>,
+    session_id: String,
+    generation: u64,
+    seq: u64,
+    bytes: usize,
+) -> Result<(), String> {
+    state
+        .session_manager
+        .ack_frontend_data(&session_id, generation, seq, bytes);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_frontend_visible(
+    state: State<'_, AppState>,
+    session_id: String,
+    visible: bool,
+    channel_id: Option<u32>,
+) -> Result<(), String> {
+    state
+        .session_manager
+        .set_frontend_visible(&session_id, visible, channel_id);
+    Ok(())
+}
+
+/// Per-window frontend visibility. Every window reports its own
+/// `document.visibilityState`, so a single shared flag let a hidden detached
+/// window slow the metadata monitor down for the main window too. The shared
+/// `AppState::frontend_visible` now carries the aggregate — "is any window
+/// on screen" — and this map holds what each window last said.
+static WINDOW_FRONTEND_VISIBILITY: std::sync::Mutex<Option<HashMap<String, bool>>> =
+    std::sync::Mutex::new(None);
+
+/// Records one window's visibility and answers whether any tracked window is
+/// still on screen. `live_labels`, when given, drops windows that no longer
+/// exist so a closed window cannot hold the aggregate up forever.
+pub(crate) fn merge_window_frontend_visibility(
+    tracked: &mut HashMap<String, bool>,
+    live_labels: Option<&std::collections::HashSet<String>>,
+    label: &str,
+    visible: bool,
+) -> bool {
+    if let Some(live) = live_labels {
+        tracked.retain(|known, _| known == label || live.contains(known));
+    }
+    tracked.insert(label.to_string(), visible);
+    tracked.values().any(|entry| *entry)
+}
+
+#[tauri::command(async)]
+pub async fn set_app_frontend_visible(
+    window: tauri::Window,
+    state: State<'_, AppState>,
+    visible: bool,
+) -> Result<(), String> {
+    // `tauri::Window`, not `tauri::WebviewWindow`: a window that hosts a web
+    // pane is no longer a webview window, and the argument would fail to
+    // resolve there.
+    let live_labels: std::collections::HashSet<String> =
+        window.app_handle().windows().into_keys().collect();
+    let any_visible = {
+        let mut guard = WINDOW_FRONTEND_VISIBILITY
+            .lock()
+            .map_err(|e| format!("Lock failed: {e}"))?;
+        let tracked = guard.get_or_insert_with(HashMap::new);
+        merge_window_frontend_visibility(tracked, Some(&live_labels), window.label(), visible)
+    };
+    state.frontend_visible.store(any_visible, Ordering::Release);
+    Ok(())
+}
+
+#[tauri::command(async)]
+pub async fn get_session_scrollback(
+    state: State<'_, AppState>,
+    session_id: String,
+    since: Option<crate::pty::session::ScrollbackCursor>,
+) -> Result<Response, String> {
+    let manager = state.session_manager.clone();
+    crate::util::task::run_blocking("get_session_scrollback", move || {
+        manager
+            .get_scrollback_snapshot(&session_id, since.as_ref())
+            .map(|snapshot| Response::new(snapshot.into_wire()))
+    }).await
+}
+
+#[tauri::command(async)]
+pub async fn has_persisted_scrollback(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    let dir = state.scrollback_dir.get().cloned();
+    crate::util::task::run_blocking("has_persisted_scrollback", move || {
+        Ok(dir.as_ref()
+            .is_some_and(|dir| crate::pty::scrollback_store::load(dir, &session_id).is_some()))
+    }).await
+}
+
+#[tauri::command(async)]
+pub async fn remove_workspace_scrollback(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    session_ids: Vec<String>,
+) -> Result<(), String> {
+    let dir = state.scrollback_dir.get().cloned();
+    crate::util::task::run_blocking("remove_workspace_scrollback", move || {
+        let Some(dir) = dir.as_ref() else {
+            return Ok(());
+        };
+        crate::pty::scrollback_store::remove_many(dir, &session_ids)
+            .map_err(|error| format!("Failed to remove scrollback for workspace {workspace_id}: {error}"))
+    }).await
+}
+
+#[tauri::command(async)]
+pub async fn discard_session_scrollback(
+    state: State<'_, AppState>,
+    session_id: String,
+) -> Result<(), String> {
+    let dir = state.scrollback_dir.get().cloned();
+    crate::util::task::run_blocking("discard_session_scrollback", move || {
+        let Some(dir) = dir.as_ref() else {
+            return Ok(());
+        };
+        crate::pty::scrollback_store::remove(dir, &session_id)
+            .map_err(|error| format!("Failed to discard scrollback for {session_id}: {error}"))
+    }).await
+}
+
+#[tauri::command(async)]
+pub async fn kill_session(app_handle: AppHandle, state: State<'_, AppState>, session_id: String) -> Result<(), String> {
+    let hooks = state.hook_service.clone();
+    let manager = state.session_manager.clone();
+    let dir = state.scrollback_dir.get().cloned();
+    let session_state = state.session_state_store.clone();
+    hooks.queue_session_drain(&session_id);
+    crate::util::task::run_blocking("kill_session", move || {
+        #[cfg(feature = "e2e")]
+        codex_restore_harness::publication_checkpoint(&session_id, "kill-enter");
+        let gate = codex_restore_lifecycle_gate(&session_id);
+        let guard = gate.lock().unwrap_or_else(|e| e.into_inner());
+        invalidate_codex_restore_notice(&app_handle, &session_id);
+        let session_epoch = manager
+            .session_observation(&session_id)
+            .map(|(session_epoch, _)| session_epoch);
+        let retired = manager.retire(&session_id);
+        // Cleanup keyed only by P must finish before any successor can use P.
+        let remove_result = if let Some(dir) = dir.as_ref() {
+            crate::pty::scrollback_store::remove(dir, &session_id)
+                .map_err(|error| format!("Failed to remove scrollback for {session_id}: {error}"))
+        } else {
+            Ok(())
+        };
+        let published_epoch = manager.session_observation(&session_id).map(|value| value.0);
+        #[cfg(feature = "e2e")]
+        codex_restore_harness::publication_checkpoint(&session_id, "kill-publish");
+        publish_codex_restore_epoch(&app_handle, &session_id, published_epoch);
+        drop(guard);
+        // Child termination / ClosePseudoConsole operate only on this retired
+        // object, outside the lifecycle gate. Never publish after its teardown.
+        #[cfg(feature = "e2e")]
+        codex_restore_harness::retirement_checkpoint(&session_id);
+        let kill_result = retired.as_ref().map_or(Ok(()), |session| session.kill());
+        drop(retired);
+        kill_result?;
+        remove_result?;
+        if let Some(session_epoch) = session_epoch {
+            session_state.ingest(
+                session_id,
+                crate::session_state::Evidence::socket_lifecycle(
+                    crate::session_state::unix_epoch_millis(),
+                    session_epoch,
+                    crate::session_state::Lifecycle::Exited,
+                ),
+            );
+        }
+        Ok(())
+    }).await
+}
+
+#[tauri::command(async)]
+pub async fn is_directory(path: String) -> bool {
+    crate::util::task::run_blocking_value("is_directory", move || {
+        std::path::Path::new(&path).is_dir()
+    }).await
+}
+
+#[tauri::command(async)]
+pub async fn get_launch_cwd() -> Option<String> {
+    crate::util::task::run_blocking_value("get_launch_cwd", move || {
+        for arg in std::env::args().skip(1) {
+            if arg.starts_with('-') {
+                continue;
+            }
+            let path = std::path::Path::new(&arg);
+            if path.is_dir() {
+                if let Ok(canonical) = path.canonicalize() {
+                    let s = canonical.to_string_lossy().to_string();
+                    // Strip Windows UNC prefix (\\?\)
+                    return Some(s.strip_prefix(r"\\?\").unwrap_or(&s).to_string());
+                }
+                return Some(arg);
+            }
+        }
+        None
+    }).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn si_t1_owner_commandline_refresh_excludes_foreign_processes_and_handles_cycles() {
+        use sysinfo::Pid;
+        let pid = Pid::from_u32;
+        let children = HashMap::from([
+            (pid(1), vec![pid(2)]),
+            (pid(2), vec![pid(3)]),
+            (pid(3), vec![pid(1), pid(4)]),
+            (pid(99), vec![pid(100)]),
+        ]);
+        let mut selected: Vec<_> = owner_commandline_pids(&children, &[pid(1), pid(1)])
+            .into_iter().map(Pid::as_u32).collect();
+        selected.sort_unstable();
+        assert_eq!(selected, vec![1, 2, 3, 4]);
+        assert_eq!(owner_commandline_pids(&children, &[pid(42)]), vec![pid(42)]);
+    }
+
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn claude_restore_keeps_explicit_launch_values_and_auto_permissions() {
+        let mut args: Vec<String> = ["--resume", "missing", "--model=opus", "--effort", "high"]
+            .into_iter().map(str::to_string).collect();
+        apply_agent_restore_fallback_args("claude", &mut args, "claude");
+        assert_eq!(args, ["--allow-dangerously-skip-permissions", "--permission-mode", "auto",
+            "--model=opus", "--effort", "high"]);
+    }
+
+    #[test]
+    fn claude_direct_launch_normalizes_permissions_and_uses_saved_env_values() {
+        let mut args: Vec<String> = ["--dangerously-skip-permissions", "--permission-mode=auto", "--resume", "saved"]
+            .into_iter().map(str::to_string).collect();
+        normalize_claude_launch_args(&mut args, &env(&[
+            ("MYCMUX_LAUNCH_MODEL", " opus "), ("MYCMUX_LAUNCH_EFFORT", " high "),
+        ]));
+        assert_eq!(args, ["--resume", "saved", "--allow-dangerously-skip-permissions",
+            "--permission-mode", "auto", "--model", "opus", "--effort", "high"]);
+        normalize_claude_launch_args(&mut args, &env(&[
+            ("MYCMUX_LAUNCH_MODEL", "sonnet"), ("MYCMUX_LAUNCH_EFFORT", "low"),
+        ]));
+        assert_eq!(claude_launch_spec_args(&args), ["--model", "opus", "--effort", "high"]);
+    }
+
+    #[test]
+    fn claude_direct_launch_does_not_invent_defaults_or_accept_unsafe_env_values() {
+        for values in [env(&[]), env(&[("MYCMUX_LAUNCH_MODEL", "$(bad)"), ("MYCMUX_LAUNCH_EFFORT", "--bad")])] {
+            let mut args = Vec::new();
+            normalize_claude_launch_args(&mut args, &values);
+            assert_eq!(args, ["--allow-dangerously-skip-permissions", "--permission-mode", "auto"]);
+        }
+    }
+
+    const RESUMED_CLAUDE_ID: &str = "019bc371-82cf-7d82-ad0b-96d026aaca73";
+
+    /// The env every restore path sends for a saved `kind` session.
+    fn resume_env(kind: &str) -> HashMap<String, String> {
+        env(&[
+            ("MYCMUX_AGENT_KIND", kind),
+            ("MYCMUX_SESSION_ID", RESUMED_CLAUDE_ID),
+            ("MYCMUX_RESUME", kind),
+        ])
+    }
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn launch_effort(env: &HashMap<String, String>) -> Option<&str> {
+        env.get("MYCMUX_LAUNCH_EFFORT").map(String::as_str)
+    }
+
+    #[test]
+    fn a_claude_resume_takes_the_effort_of_its_last_reply() {
+        let mut launch_env = resume_env("claude");
+        let mut asked = Vec::new();
+        inherit_claude_resume_effort(
+            &strings(&["--resume", RESUMED_CLAUDE_ID]),
+            &mut launch_env,
+            Some(r"C:\work"),
+            |cwd, session_id| {
+                asked.push((cwd.map(str::to_string), session_id.to_string()));
+                Some("max".to_string())
+            },
+        );
+
+        assert_eq!(launch_effort(&launch_env), Some("max"));
+        assert_eq!(
+            asked,
+            [(Some(r"C:\work".to_string()), RESUMED_CLAUDE_ID.to_string())]
+        );
+    }
+
+    #[test]
+    fn an_empty_launch_effort_is_not_a_choice() {
+        for blank in ["", "  "] {
+            let mut launch_env = resume_env("claude");
+            launch_env.insert("MYCMUX_LAUNCH_EFFORT".to_string(), blank.to_string());
+            inherit_claude_resume_effort(&[], &mut launch_env, None, |_, _| {
+                Some("xhigh".to_string())
+            });
+            assert_eq!(launch_effort(&launch_env), Some("xhigh"), "{blank:?}");
+        }
+    }
+
+    #[test]
+    fn a_claude_resume_without_a_known_effort_leaves_the_env_alone() {
+        let mut launch_env = resume_env("claude");
+        let before = launch_env.clone();
+        inherit_claude_resume_effort(&[], &mut launch_env, None, |_, _| None);
+        assert_eq!(launch_env, before);
+    }
+
+    #[test]
+    fn an_effort_the_caller_chose_is_not_replaced() {
+        let calls = std::cell::Cell::new(0);
+        let lookup = |_: Option<&str>, _: &str| {
+            calls.set(calls.get() + 1);
+            Some("max".to_string())
+        };
+
+        let mut launch_env = resume_env("claude");
+        launch_env.insert("MYCMUX_LAUNCH_EFFORT".to_string(), "low".to_string());
+        inherit_claude_resume_effort(&[], &mut launch_env, None, lookup);
+        assert_eq!(launch_effort(&launch_env), Some("low"));
+
+        for args in [
+            strings(&["--resume", RESUMED_CLAUDE_ID, "--effort", "low"]),
+            strings(&["--resume", RESUMED_CLAUDE_ID, "--effort=low"]),
+        ] {
+            let mut launch_env = resume_env("claude");
+            inherit_claude_resume_effort(&args, &mut launch_env, None, lookup);
+            assert_eq!(launch_effort(&launch_env), None, "{args:?}");
+        }
+        assert_eq!(
+            calls.get(),
+            0,
+            "an explicit effort must not cost a transcript read"
+        );
+    }
+
+    #[test]
+    fn only_a_claude_resume_inherits_an_effort() {
+        let calls = std::cell::Cell::new(0);
+        let lookup = |_: Option<&str>, _: &str| {
+            calls.set(calls.get() + 1);
+            Some("max".to_string())
+        };
+
+        for kind in ["claude-codex", "codex", "grok"] {
+            let mut launch_env = resume_env(kind);
+            inherit_claude_resume_effort(&[], &mut launch_env, None, lookup);
+            assert_eq!(launch_effort(&launch_env), None, "{kind}");
+        }
+        // A fresh Claude pane names its kind but resumes nothing.
+        let mut launch_env = env(&[("MYCMUX_AGENT_KIND", "claude")]);
+        inherit_claude_resume_effort(&[], &mut launch_env, None, lookup);
+        assert_eq!(launch_effort(&launch_env), None);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn a_session_id_that_is_not_a_uuid_is_never_looked_up() {
+        let calls = std::cell::Cell::new(0);
+        let lookup = |_: Option<&str>, _: &str| {
+            calls.set(calls.get() + 1);
+            Some("max".to_string())
+        };
+
+        for session_id in [
+            "",
+            "saved",
+            r"..\..\secrets",
+            "019bc371-82cf-7d82-ad0b-96d026aaca7",
+        ] {
+            let mut launch_env = env(&[
+                ("MYCMUX_RESUME", "claude"),
+                ("MYCMUX_SESSION_ID", session_id),
+            ]);
+            inherit_claude_resume_effort(&[], &mut launch_env, None, lookup);
+            assert_eq!(launch_effort(&launch_env), None, "{session_id:?}");
+        }
+        let mut launch_env = env(&[("MYCMUX_RESUME", "claude")]);
+        inherit_claude_resume_effort(&[], &mut launch_env, None, lookup);
+        assert_eq!(launch_effort(&launch_env), None);
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn an_inherited_effort_reaches_the_direct_claude_command_line() {
+        let mut args = strings(&["--resume", RESUMED_CLAUDE_ID]);
+        let mut launch_env = resume_env("claude");
+        inherit_claude_resume_effort(&args, &mut launch_env, None, |_, _| Some("max".to_string()));
+        normalize_claude_launch_args(&mut args, &launch_env);
+
+        assert_eq!(
+            args,
+            [
+                "--resume",
+                RESUMED_CLAUDE_ID,
+                "--allow-dangerously-skip-permissions",
+                "--permission-mode",
+                "auto",
+                "--effort",
+                "max"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_inherited_effort_survives_the_env_sanitizing_on_its_way_to_the_launcher() {
+        // launcher.ps1 / launcher.sh read MYCMUX_LAUNCH_EFFORT themselves.
+        let mut launch_env = resume_env("claude");
+        inherit_claude_resume_effort(
+            &strings(&["-NoLogo", "-NoExit", "-File", "launcher.ps1"]),
+            &mut launch_env,
+            None,
+            |_, _| Some("max".to_string()),
+        );
+        sanitize_launch_env(&mut launch_env);
+
+        assert_eq!(launch_effort(&launch_env), Some("max"));
+    }
+
+    #[test]
+    fn launch_spec_values_accept_gateway_ids_and_refuse_flags_and_shell() {
+        for good in [
+            "opus",
+            "vendor-1.2-tier",
+            "anthropic/gateway/fcc/open_router/qwen/qwen3-235b-a22b-2507",
+            &"a".repeat(128),
+        ] {
+            assert!(is_launch_spec_value(good), "{good} should pass");
+        }
+        for bad in [
+            "",
+            "--model",
+            "/abs/path",
+            "a;b",
+            "$(bad)",
+            "a b",
+            "a\\b",
+            "open_router/x:y",
+            &"a".repeat(129),
+        ] {
+            assert!(!is_launch_spec_value(bad), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_pane_internal_keys_when_no_resume_context() {
+        let mut e = env(&[
+            ("MYCMUX_PANE_SESSION_ID", "pane-1"),
+            ("MYCMUX_TAB_ID", "tab-1"),
+            ("MYCMUX_MARKDOWN_OUT", "C:/tmp/out.md"),
+            ("__CMUX_LAUNCHER_DONE", "1"),
+            ("FOO", "bar"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert!(!e.contains_key("MYCMUX_PANE_SESSION_ID"));
+        assert!(!e.contains_key("MYCMUX_TAB_ID"));
+        assert!(!e.contains_key("MYCMUX_MARKDOWN_OUT"));
+        assert!(!e.contains_key("__CMUX_LAUNCHER_DONE"));
+        assert_eq!(e.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn sanitize_strips_stray_resume_marker_without_session_id() {
+        // Bug class: MYCMUX_RESUME=1 leaks from a parent shell with no SESSION_ID.
+        // Must not reach the child or the agent will auto-resume.
+        let mut e = env(&[
+            ("MYCMUX_RESUME", "claude"),
+            ("MYCMUX_RESUME_FORK", "1"),
+            ("FOO", "bar"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert!(!e.contains_key("MYCMUX_RESUME"));
+        assert!(!e.contains_key("MYCMUX_RESUME_FORK"));
+        assert_eq!(e.get("FOO"), Some(&"bar".to_string()));
+    }
+
+    #[test]
+    fn sanitize_strips_stray_session_id_without_kind() {
+        let mut e = env(&[("MYCMUX_SESSION_ID", "abc-123")]);
+        sanitize_launch_env(&mut e);
+        assert!(!e.contains_key("MYCMUX_SESSION_ID"));
+    }
+
+    #[test]
+    fn sanitize_strips_noncanonical_case_aliases_of_ephemeral_keys() {
+        let mut e = env(&[
+            ("mycmux_pane_session_id", "pane-1"),
+            ("MyCmUx_ReSuMe", "claude"),
+            ("mYcMuX_hAnDoFf", "codex"),
+            ("__cmux_launcher_done", "1"),
+            ("SAFE", "value"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert!(e.keys().all(|key| {
+            !key.eq_ignore_ascii_case("MYCMUX_PANE_SESSION_ID")
+                && !key.eq_ignore_ascii_case("MYCMUX_RESUME")
+                && !key.eq_ignore_ascii_case("MYCMUX_HANDOFF")
+                && !key.eq_ignore_ascii_case("__CMUX_LAUNCHER_DONE")
+        }));
+        assert_eq!(e.get("SAFE"), Some(&"value".to_string()));
+    }
+
+    #[test]
+    fn isolated_login_panes_are_never_trusted_into_the_live_config() {
+        // The pane reads ~/.claude.json from the staging directory, so writing
+        // trust into the live file would only churn it for live_sync.
+        let e = env(&[
+            ("MYCMUX_AGENT_KIND", "claude"),
+            ("CLAUDE_CONFIG_DIR", "C:/data/cli_login_staging/abc"),
+        ]);
+        assert!(!should_trust_claude_workspace("claude", &e));
+        assert!(!should_trust_claude_workspace(
+            "C:/tools/claude.cmd",
+            &env(&[("CLAUDE_CONFIG_DIR", "C:/data/cli_login_staging/abc")]),
+        ));
+    }
+
+    #[test]
+    fn ordinary_claude_panes_still_trust_their_workspace() {
+        assert!(should_trust_claude_workspace(
+            "claude",
+            &env(&[("HOME", "/home/u")])
+        ));
+        assert!(should_trust_claude_workspace(
+            "bash",
+            &env(&[("MYCMUX_AGENT_KIND", "claude")])
+        ));
+        assert!(!should_trust_claude_workspace("bash", &env(&[])));
+    }
+
+    #[test]
+    fn sanitize_keeps_legitimate_resume_payload() {
+        let mut e = env(&[
+            ("MYCMUX_RESUME", "claude"),
+            ("MYCMUX_SESSION_ID", "abc-123"),
+            ("MYCMUX_AGENT_KIND", "claude"),
+            ("MYCMUX_RESUME_FORK", "1"),
+            ("MYCMUX_PANE_SESSION_ID", "should-be-stripped"),
+            ("__CMUX_LAUNCHER_DONE", "1"),
+            ("HOME", "/home/u"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert_eq!(e.get("MYCMUX_RESUME").map(String::as_str), Some("claude"));
+        assert_eq!(
+            e.get("MYCMUX_SESSION_ID").map(String::as_str),
+            Some("abc-123")
+        );
+        assert_eq!(
+            e.get("MYCMUX_AGENT_KIND").map(String::as_str),
+            Some("claude")
+        );
+        assert_eq!(e.get("MYCMUX_RESUME_FORK").map(String::as_str), Some("1"));
+        assert!(!e.contains_key("MYCMUX_PANE_SESSION_ID"));
+        assert!(!e.contains_key("__CMUX_LAUNCHER_DONE"));
+        assert_eq!(e.get("HOME").map(String::as_str), Some("/home/u"));
+    }
+
+    #[test]
+    fn sanitize_strips_fork_marker_from_codex_resume_payload() {
+        let mut e = env(&[
+            ("MYCMUX_RESUME", "codex"),
+            ("MYCMUX_SESSION_ID", "abc-123"),
+            ("MYCMUX_AGENT_KIND", "codex"),
+            ("MYCMUX_RESUME_FORK", "1"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert_eq!(e.get("MYCMUX_RESUME").map(String::as_str), Some("codex"));
+        assert_eq!(
+            e.get("MYCMUX_SESSION_ID").map(String::as_str),
+            Some("abc-123")
+        );
+        assert!(!e.contains_key("MYCMUX_RESUME_FORK"));
+    }
+
+    #[test]
+    fn sanitize_keeps_legitimate_handoff_payload() {
+        let mut e = env(&[
+            ("MYCMUX_HANDOFF", "codex"),
+            ("MYCMUX_HANDOFF_FROM", "claude"),
+            ("MYCMUX_HANDOFF_PROMPT_FILE", "/tmp/p.md"),
+            ("MYCMUX_HANDOFF_FROM_SESSION", "src-sess"),
+            ("MYCMUX_HANDOFF_LAUNCH_KIND", "handoff"),
+            ("MYCMUX_TAB_ID", "should-be-stripped"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert_eq!(e.get("MYCMUX_HANDOFF").map(String::as_str), Some("codex"));
+        assert_eq!(
+            e.get("MYCMUX_HANDOFF_FROM_SESSION").map(String::as_str),
+            Some("src-sess")
+        );
+        assert_eq!(
+            e.get("MYCMUX_HANDOFF_LAUNCH_KIND").map(String::as_str),
+            Some("handoff")
+        );
+        assert!(!e.contains_key("MYCMUX_TAB_ID"));
+    }
+
+    #[test]
+    fn sanitize_drops_forged_launch_kind() {
+        let mut e = env(&[
+            ("MYCMUX_LAUNCH_KIND", "resume"),
+            ("mycmux_launch_kind", "handoff"),
+            ("MYCMUX_RESUME", "claude"),
+            ("MYCMUX_SESSION_ID", "saved-id"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert!(!e.keys().any(|key| key.eq_ignore_ascii_case("MYCMUX_LAUNCH_KIND")));
+    }
+
+    #[test]
+    fn direct_agent_launch_kind_follows_final_command() {
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            ("claude.exe", &["--resume", "saved-id"], Some("resume")),
+            ("claude", &["--resume", "saved-id", "--fork-session"], Some("resume")),
+            ("claude", &["--session-id", "saved-id"], Some("new")),
+            ("codex.exe", &["resume", "--last"], Some("resume")),
+            ("codex", &["--no-alt-screen"], Some("new")),
+            ("grok", &["--continue"], Some("resume")),
+            ("grok", &["--no-alt-screen"], Some("new")),
+            ("claude-codex", &["--resume", "saved-id"], Some("resume")),
+            ("powershell.exe", &["-NoExit"], None),
+        ];
+        for (command, args, expected) in cases {
+            let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
+            assert_eq!(launch_kind_for_agent(command, &args), *expected, "{command}");
+        }
+    }
+
+    #[test]
+    fn terminal_shell_accepts_verbatim_command_and_rejects_unsafe_envelopes() {
+        let command = r#" printf '%s' \"quoted\"; echo $value | cat # 日本語 "#;
+        let mut valid = env(&[("MYCMUX_LAUNCH_TARGET", "shell"), ("MYCMUX_LAUNCH_COMMAND", command)]);
+        assert!(validate_terminal_shell_launch(&mut valid).is_ok());
+        sanitize_launch_env(&mut valid);
+        assert_eq!(valid.get("MYCMUX_LAUNCH_COMMAND").map(String::as_str), Some(command));
+        for bad in ["", " ", "echo ok\necho bad", "echo\rok", "echo\tok", "echo\u{1b}ok", "echo\u{85}ok", "echo\u{2028}ok", "echo\u{2029}ok"] {
+            let mut invalid = env(&[("MYCMUX_LAUNCH_TARGET", "shell"), ("MYCMUX_LAUNCH_COMMAND", bad)]);
+            let error = validate_terminal_shell_launch(&mut invalid).unwrap_err();
+            assert_eq!(error, "Terminal command must be one line of at most 4096 characters");
+        }
+        let mut boundary = env(&[("MYCMUX_LAUNCH_TARGET", "shell"), ("MYCMUX_LAUNCH_COMMAND", &"x".repeat(4096))]);
+        assert!(validate_terminal_shell_launch(&mut boundary).is_ok());
+        boundary.insert("MYCMUX_LAUNCH_COMMAND".into(), "x".repeat(4097));
+        assert!(validate_terminal_shell_launch(&mut boundary).is_err());
+        boundary.insert("MYCMUX_LAUNCH_COMMAND".into(), "\u{1f600}".repeat(2049));
+        assert!(validate_terminal_shell_launch(&mut boundary).is_err());
+        for target in ["invalid", "shell;echo secret", "claude"] {
+            let mut invalid = env(&[("MYCMUX_LAUNCH_TARGET", target), ("MYCMUX_LAUNCH_COMMAND", "secret")]);
+            let error = validate_terminal_shell_launch(&mut invalid).unwrap_err();
+            assert!(!error.contains("secret"));
+        }
+        let mut aliases = env(&[("mycmux_launch_command", "secret"), ("mycmux_launch_target", "shell")]);
+        assert!(validate_terminal_shell_launch(&mut aliases).is_ok());
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn sanitize_keeps_cursor_fresh_prompt_payload() {
+        for from_session in ["external", "caller-session"] {
+            let mut e = env(&[
+                ("MYCMUX_LAUNCH_TARGET", "cursor"),
+                ("MYCMUX_HANDOFF", "cursor"),
+                ("MYCMUX_HANDOFF_PROMPT_FILE", "C:/prompts/task.md"),
+                ("MYCMUX_HANDOFF_FROM_SESSION", from_session),
+                ("MYCMUX_HANDOFF_LAUNCH_KIND", "new"),
+                ("MYCMUX_LAUNCH_MODEL", "composer-2.5"),
+            ]);
+            let expected = e.clone();
+            sanitize_launch_env(&mut e);
+            assert_eq!(e, expected, "Cursor prompt source: {from_session}");
+        }
+    }
+
+    #[test]
+    fn sanitize_drops_partial_handoff_without_from_session() {
+        // Incomplete handoff payload — likely env leak — must be stripped wholesale.
+        let mut e = env(&[
+            ("MYCMUX_HANDOFF", "codex"),
+            ("MYCMUX_HANDOFF_PROMPT_FILE", "/tmp/p.md"),
+            ("MYCMUX_HANDOFF_LAUNCH_KIND", "new"),
+        ]);
+        sanitize_launch_env(&mut e);
+        assert!(!e.contains_key("MYCMUX_HANDOFF"));
+        assert!(!e.contains_key("MYCMUX_HANDOFF_PROMPT_FILE"));
+        assert!(!e.contains_key("MYCMUX_HANDOFF_LAUNCH_KIND"));
+    }
+
+    #[test]
+    fn sanitize_rejects_unknown_agent_kind() {
+        // Spoofing attempt: MYCMUX_RESUME=evil with a SESSION_ID. is_agent_session_kind
+        // should reject "evil" and the whole resume trio must be stripped.
+        let mut e = env(&[("MYCMUX_RESUME", "evil"), ("MYCMUX_SESSION_ID", "abc-123")]);
+        sanitize_launch_env(&mut e);
+        assert!(!e.contains_key("MYCMUX_RESUME"));
+        assert!(!e.contains_key("MYCMUX_SESSION_ID"));
+    }
+
+    #[test]
+    fn restore_missing_codex_session_starts_fresh_without_last() {
+        let mut args = vec![
+            "resume".to_string(),
+            "--no-alt-screen".to_string(),
+            "-C".to_string(),
+            "C:\\work".to_string(),
+            "missing-session".to_string(),
+        ];
+        apply_agent_restore_fallback_args("codex", &mut args, "codex");
+        assert_eq!(
+            args,
+            vec![
+                "--no-alt-screen".to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "missing-session"));
+        assert!(!args.iter().any(|arg| arg == "--last"));
+    }
+
+    #[test]
+    fn restore_missing_requested_id_does_not_probe_any_fallback() {
+        let mut args = vec![
+            "--allow-dangerously-skip-permissions".to_string(),
+            "--permission-mode".to_string(),
+            "auto".to_string(),
+            "--resume".to_string(),
+            "missing-session".to_string(),
+        ];
+        let fallback_ids = vec![
+            "also-missing".to_string(),
+            "existing-transcript".to_string(),
+            "later-existing-transcript".to_string(),
+        ];
+
+        let recovery = apply_agent_restore_recovery_args_with(
+            "claude",
+            &mut args,
+            "claude",
+            "missing-session",
+            &fallback_ids,
+            Some("C:\\work"),
+            |_, session_id, _| {
+                assert_eq!(session_id, "missing-session");
+                false
+            },
+        );
+
+        assert_eq!(recovery, AgentRestoreRecovery::Downgrade);
+        assert!(!args.iter().any(|arg| arg == "existing-transcript"));
+        assert!(!args.iter().any(|arg| arg == "missing-session"));
+        assert!(!args.iter().any(|arg| arg == "--continue"));
+    }
+
+    #[test]
+    fn restore_invalid_agent_session_starts_fresh_for_every_agent_kind() {
+        for (command, kind) in [
+            ("claude", "claude"),
+            ("codex", "codex"),
+            ("claude-codex", "claude-codex"),
+            ("grok", "grok"),
+        ] {
+            let mut args = vec![
+                "resume".to_string(),
+                "--resume".to_string(),
+                "missing-session".to_string(),
+                "--continue".to_string(),
+                "--last".to_string(),
+            ];
+
+            apply_agent_restore_fallback_args(command, &mut args, kind);
+
+            assert!(
+                !args.iter().any(|arg| {
+                    matches!(arg.as_str(), "resume" | "--resume" | "--continue" | "--last" | "missing-session")
+                }),
+                "{kind} restore args unexpectedly retained a resume fallback: {args:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn restore_missing_requested_id_starts_fresh_without_continue() {
+        let mut args = vec!["--resume".to_string(), "missing-session".to_string()];
+        let fallback_ids = vec!["also-missing".to_string()];
+
+        let recovery = apply_agent_restore_recovery_args_with(
+            "claude",
+            &mut args,
+            "claude",
+            "missing-session",
+            &fallback_ids,
+            Some("C:\\work"),
+            |_, _, _| false,
+        );
+
+        assert_eq!(recovery, AgentRestoreRecovery::Downgrade);
+        assert_eq!(
+            args,
+            vec![
+                "--allow-dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "auto".to_string(),
+            ]
+        );
+        assert!(!args.iter().any(|arg| arg == "--continue"));
+    }
+
+    #[test]
+    fn a_claude_session_nobody_wrote_to_starts_under_the_same_id() {
+        // The pane was opened and never typed into, so there is no transcript
+        // to find — and nothing to lose by starting under the id it carries.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019bc371-82cf-7d82-ad0b-96d026aaca73";
+        let mut args = vec![
+            "--allow-dangerously-skip-permissions".to_string(),
+            "--permission-mode".to_string(),
+            "auto".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+        ];
+
+        let recovery = apply_agent_restore_recovery_args_with(
+            "claude",
+            &mut args,
+            "claude",
+            session_id,
+            &[],
+            Some(dir.path().to_str().unwrap()),
+            |_, _, _| false,
+        );
+
+        assert_eq!(recovery, AgentRestoreRecovery::FreshUnderRequestedId);
+        assert_eq!(
+            args,
+            vec![
+                "--allow-dangerously-skip-permissions".to_string(),
+                "--permission-mode".to_string(),
+                "auto".to_string(),
+                "--session-id".to_string(),
+                session_id.to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_pinned_id_keeps_the_model_and_effort_the_pane_was_launched_with() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019bc371-82cf-7d82-ad0b-96d026aaca73";
+        let mut args = vec![
+            "--model".to_string(),
+            "opus".to_string(),
+            "--resume".to_string(),
+            session_id.to_string(),
+        ];
+
+        apply_agent_restore_recovery_args_with(
+            "claude",
+            &mut args,
+            "claude",
+            session_id,
+            &[],
+            Some(dir.path().to_str().unwrap()),
+            |_, _, _| false,
+        );
+
+        assert!(args.windows(2).any(|pair| pair == ["--model", "opus"]));
+        assert!(args.windows(2).any(|pair| pair == ["--session-id", session_id]));
+    }
+
+    #[test]
+    fn a_launcher_command_is_left_to_pin_the_id_itself() {
+        // launcher.sh reads MYCMUX_SESSION_ID and writes the pane mapping; its
+        // arguments must not be rewritten into a Claude command line.
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019bc371-82cf-7d82-ad0b-96d026aaca73";
+        let mut args = vec!["-i".to_string(), "-c".to_string(), "source launcher.sh".to_string()];
+        let original = args.clone();
+
+        let recovery = apply_agent_restore_recovery_args_with(
+            "/bin/bash",
+            &mut args,
+            "claude",
+            session_id,
+            &[],
+            Some(dir.path().to_str().unwrap()),
+            |_, _, _| false,
+        );
+
+        assert_eq!(recovery, AgentRestoreRecovery::FreshUnderRequestedId);
+        assert_eq!(args, original);
+    }
+
+    #[test]
+    fn a_session_id_without_a_working_directory_still_starts_fresh() {
+        let session_id = "019bc371-82cf-7d82-ad0b-96d026aaca73";
+        let mut args = vec!["--resume".to_string(), session_id.to_string()];
+
+        let recovery = apply_agent_restore_recovery_args_with(
+            "claude",
+            &mut args,
+            "claude",
+            session_id,
+            &[],
+            Some(r"C:\definitely-not-a-directory-9f2a"),
+            |_, _, _| false,
+        );
+
+        assert_eq!(recovery, AgentRestoreRecovery::Downgrade);
+        assert!(!args.iter().any(|arg| arg == "--session-id"));
+    }
+
+    #[test]
+    fn restore_valid_requested_id_ignores_fallbacks() {
+        let mut args = vec!["--resume".to_string(), "requested-session".to_string()];
+        let original = args.clone();
+        let fallback_ids = vec!["existing-transcript".to_string()];
+
+        let recovery = apply_agent_restore_recovery_args_with(
+            "claude",
+            &mut args,
+            "claude",
+            "requested-session",
+            &fallback_ids,
+            Some("C:\\work"),
+            |_, session_id, _| {
+                assert_eq!(session_id, "requested-session");
+                true
+            },
+        );
+
+        assert_eq!(recovery, AgentRestoreRecovery::RequestedValid);
+        assert_eq!(args, original);
+    }
+
+    #[test]
+    fn restore_fallback_args_leave_launcher_shell_args_alone() {
+        let mut args = vec![
+            "-i".to_string(),
+            "-c".to_string(),
+            "source \"$HOME/.mycmux/bin/launcher.sh\"".to_string(),
+        ];
+        let original = args.clone();
+        apply_agent_restore_fallback_args("bash", &mut args, "codex");
+        assert_eq!(args, original);
+    }
+
+    #[test]
+    fn injects_no_color_for_direct_agy_launch() {
+        let mut e = env(&[]);
+        inject_no_color_for_agy("agy", &mut e);
+        assert_eq!(e.get("NO_COLOR"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn injects_no_color_for_antigravity_and_gemini_leaves_too() {
+        let mut e = env(&[]);
+        inject_no_color_for_agy(
+            "C:\\Users\\example\\AppData\\Local\\agy\\bin\\antigravity.exe",
+            &mut e,
+        );
+        assert_eq!(e.get("NO_COLOR"), Some(&"1".to_string()));
+
+        let mut e2 = env(&[]);
+        inject_no_color_for_agy("gemini", &mut e2);
+        assert_eq!(e2.get("NO_COLOR"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn injects_no_color_leaves_existing_value_alone() {
+        let mut e = env(&[("NO_COLOR", "0")]);
+        inject_no_color_for_agy("agy", &mut e);
+        assert_eq!(e.get("NO_COLOR"), Some(&"0".to_string()));
+    }
+
+    #[test]
+    fn does_not_inject_no_color_for_unrelated_commands() {
+        let mut e = env(&[]);
+        inject_no_color_for_agy("bash", &mut e);
+        assert!(!e.contains_key("NO_COLOR"));
+    }
+
+    #[test]
+    fn a_hidden_detached_window_does_not_make_the_whole_app_look_hidden() {
+        let live: std::collections::HashSet<String> =
+            ["main", "pane-1"].into_iter().map(String::from).collect();
+        let mut tracked = HashMap::new();
+
+        assert!(merge_window_frontend_visibility(
+            &mut tracked,
+            Some(&live),
+            "main",
+            true
+        ));
+        // The detached window goes behind something; main is still on screen.
+        assert!(merge_window_frontend_visibility(
+            &mut tracked,
+            Some(&live),
+            "pane-1",
+            false
+        ));
+        // Only once every window is hidden does the app count as hidden.
+        assert!(!merge_window_frontend_visibility(
+            &mut tracked,
+            Some(&live),
+            "main",
+            false
+        ));
+    }
+
+    #[test]
+    fn a_closed_window_stops_holding_the_aggregate_up() {
+        let mut tracked = HashMap::new();
+        let both: std::collections::HashSet<String> =
+            ["main", "pane-1"].into_iter().map(String::from).collect();
+        merge_window_frontend_visibility(&mut tracked, Some(&both), "pane-1", true);
+
+        let only_main: std::collections::HashSet<String> =
+            ["main"].into_iter().map(String::from).collect();
+        assert!(!merge_window_frontend_visibility(
+            &mut tracked,
+            Some(&only_main),
+            "main",
+            false
+        ));
+        assert_eq!(tracked.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod f4_profile_owner_tests {
+    use super::*;
+    #[test]
+    fn f4_codex_profile_retains_the_duplicate_launch_owner() {
+        let args = ["codex", "-p", "sample-profile", "resume", "11111111-1111-4111-8111-111111111111"].map(str::to_string);
+        let interactive = !crate::agent_state::is_noninteractive_agent("codex", &args);
+        let conversation = Conversation::new("codex", &args[4]).unwrap();
+        assert_eq!(owner_conversation(interactive, None, Some(conversation.clone()), None, None, None), Some(conversation));
+    }
+}
+
+#[cfg(test)]
+mod n3_restore_bindings {
+    use super::*;
+    fn restore_entry(command: &str, args: &[String], env: &HashMap<String, String>, reason: Option<&str>) -> bool {
+        codex_restore_requested(command, args, env, reason)
+    }
+    fn restore_wrapper(command: &str, args: &mut Vec<String>) -> String {
+        wrap_codex_restore(command, args, "codex", &["--no-alt-screen".into()])
+    }
+    include!("../../../tests/helpers/codex_restore_native.rs");
+}

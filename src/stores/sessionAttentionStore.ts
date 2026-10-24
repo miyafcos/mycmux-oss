@@ -1,0 +1,533 @@
+import { create } from "zustand";
+import { invalidatePtyReads, observePtyEpoch } from "../lib/ptyReadGeneration";
+import {
+  getSessionStatusSnapshot,
+  onSessionStatusChanged,
+  type FeedSessionPayload,
+  type SessionAttentionKind,
+  type SessionStatusChangedPayload,
+  type SessionStatusSnapshotPayload,
+  type SessionUiState,
+  type DormancyRecordReceipt,
+} from "../lib/ipc";
+import { readSessionStatusSignals, type SessionStatusSignals } from "../lib/sessionStatusSignals";
+import type { PaneTab, Workspace } from "../types";
+
+export const SEEN_ATTENTION_STORAGE_KEY = "mycmux:seen-attention-by-tab";
+export const DONE_MARK_STORAGE_KEY = "mycmux:done-mark-by-tab";
+export const DORMANT_COMPLETIONS_STORAGE_KEY = "mycmux:dormant-completions";
+
+interface StorageLike {
+  getItem: (key: string) => string | null;
+  setItem: (key: string, value: string) => void;
+}
+
+export interface SessionAttention {
+  sessionId: string;
+  sessionEpoch: number | null;
+  attentionId: string | null;
+  kind: SessionAttentionKind;
+  detail: string | null;
+  sessionRevision: number;
+  uiState: SessionUiState;
+  stateSince: number;
+  occurrenceOrder: number;
+}
+
+export interface DormantCompletionRecord {
+  receipt: DormancyRecordReceipt;
+  tabIds: string[];
+  attention: SessionAttention;
+}
+
+export type AttentionCategory = "waiting" | "error" | "done";
+
+/** Only states that require a person to act belong in notification UI. */
+export const BLOCKING_ATTENTION_CATEGORIES = ["waiting", "error"] as const;
+
+export function isBlockingAttention(
+  category: AttentionCategory | null | undefined,
+): category is (typeof BLOCKING_ATTENTION_CATEGORIES)[number] {
+  return category !== null && category !== undefined
+    && (BLOCKING_ATTENTION_CATEGORIES as readonly string[]).includes(category);
+}
+
+export interface AttentionTabTarget {
+  workspaceId: string;
+  paneId: string;
+  tab: PaneTab;
+  attention: SessionAttention;
+  category: AttentionCategory;
+}
+
+interface SessionAttentionState {
+  attentionBySession: Record<string, SessionAttention>;
+  statusSignalsBySession: Record<string, SessionStatusSignals>;
+  seenAttentionByTab: Map<string, string>;
+  doneMarkByTab: Map<string, number>;
+  dormantCompletionsBySession: Record<string, DormantCompletionRecord>;
+  preserveDormantCompletion: (sessionId: string, tabIds: string[], receipt: DormancyRecordReceipt, expectedAttentionId: string | null) => boolean;
+  nextOccurrenceOrder: number;
+  serverEpoch: string | null;
+  lastSeq: number;
+  applySnapshot: (payload: SessionStatusSnapshotPayload) => void;
+  applyChanged: (payload: SessionStatusChangedPayload) => void;
+  markSeen: (tabId: string, attentionId: string) => void;
+  markDone: (tabId: string, at: number) => void;
+  clearDoneMark: (tabId: string) => void;
+  hydrateSeen: () => void;
+  resetForTests: () => void;
+}
+
+function browserStorage(): StorageLike | null {
+  try {
+    return typeof window === "undefined" ? null : window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+export function readDormantCompletions(storage: StorageLike | null = browserStorage()): Record<string, DormantCompletionRecord> {
+  try {
+    const parsed: unknown = JSON.parse(storage?.getItem(DORMANT_COMPLETIONS_STORAGE_KEY) ?? "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).filter(([id, value]) => {
+      const record = value as Partial<DormantCompletionRecord> | null;
+      const receipt = record?.receipt;
+      return receipt?.ptySessionId === id && (receipt.agentKind === "claude" || receipt.agentKind === "codex")
+        && typeof receipt.agentSessionId === "string" && receipt.agentSessionId.length > 0
+        && Number.isSafeInteger(receipt.bytes) && receipt.bytes > 0 && Number.isSafeInteger(receipt.savedAt)
+        && Number.isSafeInteger(receipt.ptyGeneration) && Array.isArray(record?.tabIds)
+        && record.tabIds.every((tabId) => typeof tabId === "string")
+        && record.attention?.kind === "done" && typeof record.attention.attentionId === "string"
+        && record.attention.sessionId === id;
+    })) as Record<string, DormantCompletionRecord>;
+  } catch { return {}; }
+}
+
+function persistDormantCompletions(records: Record<string, DormantCompletionRecord>): boolean {
+  try {
+    const storage = browserStorage();
+    if (!storage) return false;
+    storage.setItem(DORMANT_COMPLETIONS_STORAGE_KEY, JSON.stringify(records));
+    return true;
+  } catch { return false; }
+}
+
+type AttentionFeedState = Pick<SessionAttentionState, "attentionBySession" | "statusSignalsBySession" | "nextOccurrenceOrder">;
+function retainDormantCompletions(
+  next: AttentionFeedState,
+  previousRecords: Record<string, DormantCompletionRecord>,
+  payloads: FeedSessionPayload[],
+): AttentionFeedState & Pick<SessionAttentionState, "dormantCompletionsBySession"> {
+  const records = { ...previousRecords };
+  let changed = false;
+  for (const payload of payloads) {
+    const record = records[payload.session_id];
+    if (!record || (next.attentionBySession[payload.session_id]?.sessionRevision ?? 0) > payload.session_revision) continue;
+    if (payload.status.lifecycle === "alive" && (
+      payload.status.session_epoch !== record.attention.sessionEpoch || payload.status.ui_state === "working"
+      || (payload.status.attention.kind !== "none" && payload.status.attention.kind !== "done")
+      || (payload.status.attention.kind === "done" && payload.status.attention.attention_id !== record.attention.attentionId)
+    )) { delete records[payload.session_id]; changed = true; }
+  }
+  const attentionBySession = { ...next.attentionBySession };
+  for (const [sessionId, record] of Object.entries(records)) {
+    const current = attentionBySession[sessionId];
+    if (!current || current.kind === "none") attentionBySession[sessionId] = {
+      ...record.attention, sessionRevision: current?.sessionRevision ?? record.attention.sessionRevision,
+    };
+  }
+  if (changed) persistDormantCompletions(records);
+  return { ...next, attentionBySession, dormantCompletionsBySession: records };
+}
+
+export function readSeenAttention(storage: StorageLike | null = browserStorage()): Map<string, string> {
+  if (!storage) return new Map();
+  try {
+    const raw = storage.getItem(SEEN_ATTENTION_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Map();
+    return new Map(parsed.filter(
+      (entry): entry is [string, string] => Array.isArray(entry)
+        && entry.length === 2
+        && typeof entry[0] === "string"
+        && typeof entry[1] === "string",
+    ));
+  } catch {
+    return new Map();
+  }
+}
+
+function persistSeenAttention(seen: Map<string, string>): void {
+  const storage = browserStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(SEEN_ATTENTION_STORAGE_KEY, JSON.stringify([...seen.entries()]));
+  } catch {
+    // Client-local read state is best-effort when storage is unavailable.
+  }
+}
+
+export function readDoneMarks(storage: StorageLike | null = browserStorage()): Map<string, number> {
+  if (!storage) return new Map();
+  try {
+    const raw = storage.getItem(DONE_MARK_STORAGE_KEY);
+    if (!raw) return new Map();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Map();
+    return new Map(parsed.filter(
+      (entry): entry is [string, number] => Array.isArray(entry)
+        && entry.length === 2
+        && typeof entry[0] === "string"
+        && typeof entry[1] === "number"
+        && Number.isFinite(entry[1]),
+    ));
+  } catch {
+    return new Map();
+  }
+}
+
+function persistDoneMarks(doneMarkByTab: Map<string, number>): void {
+  const storage = browserStorage();
+  if (!storage) return;
+  try {
+    storage.setItem(DONE_MARK_STORAGE_KEY, JSON.stringify([...doneMarkByTab.entries()]));
+  } catch {
+    // Client-local read state is best-effort when storage is unavailable.
+  }
+}
+
+function toSessionAttention(
+  payload: FeedSessionPayload,
+  occurrenceOrder: number,
+): SessionAttention {
+  return {
+    sessionId: payload.session_id,
+    sessionEpoch: payload.status.session_epoch,
+    attentionId: payload.status.attention.attention_id,
+    kind: payload.status.attention.kind,
+    detail: payload.status.attention.detail,
+    sessionRevision: payload.session_revision,
+    uiState: payload.status.ui_state,
+    stateSince: payload.status.attention.state_since,
+    occurrenceOrder,
+  };
+}
+
+function applyPayload(
+  state: Pick<SessionAttentionState, "attentionBySession" | "statusSignalsBySession" | "nextOccurrenceOrder">,
+  payload: FeedSessionPayload,
+): Pick<SessionAttentionState, "attentionBySession" | "statusSignalsBySession" | "nextOccurrenceOrder"> {
+  const previous = state.attentionBySession[payload.session_id];
+  if (previous && payload.session_revision < previous.sessionRevision) return state;
+
+  const sameAttention = previous?.attentionId === payload.status.attention.attention_id;
+  const occurrenceOrder = sameAttention && previous
+    ? previous.occurrenceOrder
+    : state.nextOccurrenceOrder;
+  const next = toSessionAttention(payload, occurrenceOrder);
+  const signals = readSessionStatusSignals(payload.status);
+  const previousSignals = state.statusSignalsBySession[payload.session_id];
+  if (
+    previous
+    && previous.attentionId === next.attentionId
+    && previous.sessionEpoch === next.sessionEpoch
+    && previous.kind === next.kind
+    && previous.detail === next.detail
+    && previous.sessionRevision === next.sessionRevision
+    && previous.uiState === next.uiState
+    && previous.stateSince === next.stateSince
+    && previousSignals?.activity === signals.activity
+    && previousSignals?.health === signals.health
+    && previousSignals?.lastOutputAt === signals.lastOutputAt
+    && previousSignals?.lastMonitorAt === signals.lastMonitorAt
+    && previousSignals?.lastEvidenceAt === signals.lastEvidenceAt
+    && previousSignals?.processStartedAt === signals.processStartedAt
+  ) {
+    return state;
+  }
+
+  return {
+    attentionBySession: {
+      ...state.attentionBySession,
+      [payload.session_id]: next,
+    },
+    statusSignalsBySession: {
+      ...state.statusSignalsBySession,
+      [payload.session_id]: signals,
+    },
+    nextOccurrenceOrder: sameAttention && previous
+      ? state.nextOccurrenceOrder
+      : state.nextOccurrenceOrder + 1,
+  };
+}
+
+export function isAttentionUnseen(
+  tabId: string,
+  attention: SessionAttention | undefined,
+  seenAttentionByTab: Map<string, string>,
+): boolean {
+  return Boolean(
+    attention?.attentionId
+    && attention.kind !== "none"
+    && seenAttentionByTab.get(tabId) !== attention.attentionId,
+  );
+}
+
+export function attentionCategory(
+  tabId: string,
+  attention: SessionAttention | undefined,
+  seenAttentionByTab: Map<string, string>,
+): AttentionCategory | null {
+  if (!attention?.attentionId) return null;
+  if (attention.kind === "input" || attention.kind === "approval") return "waiting";
+  if (attention.kind === "error" || attention.kind === "rate_limited") return "error";
+  if (attention.kind === "done" && isAttentionUnseen(tabId, attention, seenAttentionByTab)) {
+    return "done";
+  }
+  return null;
+}
+
+export function attentionDetail(attention: SessionAttention | undefined): string | null {
+  if (!attention || (attention.kind !== "input" && attention.kind !== "approval" && attention.kind !== "rate_limited")) return null;
+  const detail = attention.detail?.replace(/\s+/g, " ").trim();
+  return detail || null;
+}
+
+export function resolveAttentionTabs(
+  tabs: PaneTab[],
+  attentionBySession: Record<string, SessionAttention | undefined>,
+  seenAttentionByTab: Map<string, string>,
+): Array<{ tab: PaneTab; attention: SessionAttention; category: AttentionCategory }> {
+  return tabs
+    .map((tab) => {
+      const attention = attentionBySession[tab.sessionId];
+      const category = attentionCategory(tab.id, attention, seenAttentionByTab);
+      return attention && category ? { tab, attention, category } : null;
+    })
+    .filter((item): item is { tab: PaneTab; attention: SessionAttention; category: AttentionCategory } => Boolean(item))
+    .sort((left, right) => left.attention.occurrenceOrder - right.attention.occurrenceOrder);
+}
+
+const ATTENTION_PRIORITY: Record<AttentionCategory, number> = {
+  waiting: 0,
+  error: 1,
+  done: 2,
+};
+
+export interface UnseenAttentionSummary {
+  /** How many of the given tabs carry unseen actionable attention. */
+  count: number;
+  /** The most urgent of those categories, or null when count is 0. */
+  category: AttentionCategory | null;
+}
+
+/**
+ * Roll a set of tabs up into the single indicator a container row can show.
+ *
+ * Deliberately built from the same `isAttentionUnseen` + `attentionCategory`
+ * pair the pane tab pills use, so a workspace row and its pills can never
+ * disagree about what counts as unread.
+ */
+export function summarizeUnseenAttention(
+  tabs: readonly Pick<PaneTab, "id" | "sessionId">[],
+  attentionBySession: Record<string, SessionAttention | undefined>,
+  seenAttentionByTab: Map<string, string>,
+): UnseenAttentionSummary {
+  let count = 0;
+  let category: AttentionCategory | null = null;
+  for (const tab of tabs) {
+    const attention = attentionBySession[tab.sessionId];
+    if (!isAttentionUnseen(tab.id, attention, seenAttentionByTab)) continue;
+    const tabCategory = attentionCategory(tab.id, attention, seenAttentionByTab);
+    if (!isBlockingAttention(tabCategory)) continue;
+    count += 1;
+    if (category === null || ATTENTION_PRIORITY[tabCategory] < ATTENTION_PRIORITY[category]) {
+      category = tabCategory;
+    }
+  }
+  return { count, category };
+}
+
+export function resolveNextAttentionTarget(
+  workspaces: Workspace[],
+  attentionBySession: Record<string, SessionAttention>,
+  seenAttentionByTab: Map<string, string>,
+  currentTabId: string | null,
+): AttentionTabTarget | null {
+  const candidates: AttentionTabTarget[] = [];
+  for (const workspace of workspaces) {
+    for (const pane of workspace.panes) {
+      for (const tab of pane.tabs) {
+        const attention = attentionBySession[tab.sessionId];
+        const category = attentionCategory(tab.id, attention, seenAttentionByTab);
+        if (attention && isBlockingAttention(category)) {
+          candidates.push({ workspaceId: workspace.id, paneId: pane.id, tab, attention, category });
+        }
+      }
+    }
+  }
+  candidates.sort((left, right) => (
+    ATTENTION_PRIORITY[left.category] - ATTENTION_PRIORITY[right.category]
+    || left.attention.occurrenceOrder - right.attention.occurrenceOrder
+  ));
+  if (candidates.length === 0) return null;
+
+  const currentIndex = currentTabId
+    ? candidates.findIndex((candidate) => candidate.tab.id === currentTabId)
+    : -1;
+  if (currentIndex < 0) return candidates[0];
+  if (candidates.length === 1) return null;
+  return candidates[(currentIndex + 1) % candidates.length];
+}
+
+const initialDormantCompletions = readDormantCompletions();
+export const useSessionAttentionStore = create<SessionAttentionState>((set) => ({
+  attentionBySession: Object.fromEntries(Object.entries(initialDormantCompletions).map(([id, record]) => [id, record.attention])),
+  statusSignalsBySession: {},
+  seenAttentionByTab: readSeenAttention(),
+  doneMarkByTab: readDoneMarks(),
+  dormantCompletionsBySession: initialDormantCompletions,
+  nextOccurrenceOrder: 1,
+  serverEpoch: null,
+  lastSeq: 0,
+
+  applySnapshot: (payload) => set((state) => {
+    if (state.serverEpoch === payload.server_epoch && payload.seq < state.lastSeq) return state;
+    let next: Pick<SessionAttentionState, "attentionBySession" | "statusSignalsBySession" | "nextOccurrenceOrder"> = {
+      attentionBySession: {},
+      statusSignalsBySession: {},
+      nextOccurrenceOrder: 1,
+    };
+    const ordered = [...payload.sessions].sort((left, right) => (
+      left.status.attention.state_since - right.status.attention.state_since
+      || left.session_id.localeCompare(right.session_id)
+    ));
+    for (const session of ordered) next = applyPayload(next, session);
+    return { ...retainDormantCompletions(next, state.dormantCompletionsBySession, payload.sessions), serverEpoch: payload.server_epoch, lastSeq: payload.seq };
+  }),
+
+  applyChanged: (payload) => set((state) => {
+    const sameEpoch = state.serverEpoch === payload.server_epoch;
+    if (sameEpoch && payload.seq <= state.lastSeq) return state;
+    const base = sameEpoch
+      ? state
+      : { attentionBySession: {}, statusSignalsBySession: {}, nextOccurrenceOrder: 1 };
+    return {
+      ...retainDormantCompletions(applyPayload(base, payload), state.dormantCompletionsBySession, [payload]),
+      serverEpoch: payload.server_epoch,
+      lastSeq: payload.seq,
+    };
+  }),
+
+  preserveDormantCompletion: (sessionId, tabIds, receipt, expectedAttentionId) => {
+    let preserved = false;
+    set((state) => {
+      const current = state.attentionBySession[sessionId];
+      if (receipt.ptySessionId !== sessionId || receipt.bytes <= 0 || !Number.isFinite(receipt.bytes)
+        || !Number.isSafeInteger(receipt.savedAt) || !Number.isSafeInteger(receipt.ptyGeneration) || tabIds.length === 0
+        || (current && (current.uiState === "working" || !["none", "done"].includes(current.kind)))
+        || (expectedAttentionId !== null && current?.attentionId !== expectedAttentionId)
+        || (current?.sessionEpoch != null && current.sessionEpoch !== receipt.ptyGeneration)) return state;
+      const attention: SessionAttention = current?.kind === "done" && current.attentionId ? { ...current } : {
+        sessionId, sessionEpoch: receipt.ptyGeneration, attentionId: `dormant:${receipt.agentSessionId}:${receipt.savedAt}`,
+        kind: "done", detail: null, sessionRevision: current?.sessionRevision ?? 0, uiState: "done",
+        stateSince: receipt.savedAt, occurrenceOrder: state.nextOccurrenceOrder,
+      };
+      const records = { ...state.dormantCompletionsBySession, [sessionId]: { receipt, tabIds, attention } };
+      if (!persistDormantCompletions(records)) return state;
+      preserved = true;
+      return { dormantCompletionsBySession: records,
+        nextOccurrenceOrder: current?.kind === "done" ? state.nextOccurrenceOrder : state.nextOccurrenceOrder + 1,
+        attentionBySession: { ...state.attentionBySession, [sessionId]: attention } };
+    });
+    return preserved;
+  },
+
+  markSeen: (tabId, attentionId) => set((state) => {
+    if (state.seenAttentionByTab.get(tabId) === attentionId) return state;
+    const seenAttentionByTab = new Map(state.seenAttentionByTab);
+    seenAttentionByTab.set(tabId, attentionId);
+    persistSeenAttention(seenAttentionByTab);
+    return { seenAttentionByTab };
+  }),
+
+  markDone: (tabId, at) => set((state) => {
+    if (!Number.isFinite(at) || state.doneMarkByTab.get(tabId) === at) return state;
+    const doneMarkByTab = new Map(state.doneMarkByTab);
+    doneMarkByTab.set(tabId, at);
+    persistDoneMarks(doneMarkByTab);
+    return { doneMarkByTab };
+  }),
+
+  clearDoneMark: (tabId) => set((state) => {
+    if (!state.doneMarkByTab.has(tabId)) return state;
+    const doneMarkByTab = new Map(state.doneMarkByTab);
+    doneMarkByTab.delete(tabId);
+    persistDoneMarks(doneMarkByTab);
+    return { doneMarkByTab };
+  }),
+
+  hydrateSeen: () => set((state) => {
+    const dormantCompletionsBySession = readDormantCompletions();
+    return { seenAttentionByTab: readSeenAttention(), doneMarkByTab: readDoneMarks(),
+      ...retainDormantCompletions({ attentionBySession: state.attentionBySession,
+        statusSignalsBySession: state.statusSignalsBySession, nextOccurrenceOrder: state.nextOccurrenceOrder }, dormantCompletionsBySession, []) };
+  }),
+
+  resetForTests: () => set({
+    attentionBySession: {},
+    statusSignalsBySession: {},
+    seenAttentionByTab: new Map(),
+    doneMarkByTab: new Map(),
+    dormantCompletionsBySession: {},
+    nextOccurrenceOrder: 1,
+    serverEpoch: null,
+    lastSeq: 0,
+  }),
+}));
+
+// Accepted feed changes fence reads immediately; frontend attachment counters
+// and retained dormant completion records are not producer generations.
+useSessionAttentionStore.subscribe((state, previous) => {
+  const restarted = previous.serverEpoch !== null && state.serverEpoch !== null && previous.serverEpoch !== state.serverEpoch;
+  if (restarted) {
+    for (const id of new Set([...Object.keys(previous.attentionBySession), ...Object.keys(state.attentionBySession)])) {
+      invalidatePtyReads(id, Boolean(state.attentionBySession[id]?.sessionEpoch)).epoch = undefined;
+    }
+  }
+  for (const [id, attention] of Object.entries(state.attentionBySession)) {
+    if (attention === previous.attentionBySession[id] && !restarted) continue;
+    if (state.dormantCompletionsBySession[id]?.attention.sessionEpoch === attention.sessionEpoch) continue;
+    if (attention.sessionEpoch === null && previous.attentionBySession[id]?.sessionEpoch != null) invalidatePtyReads(id);
+    if (attention.sessionEpoch !== null) observePtyEpoch(id, attention.sessionEpoch);
+  }
+});
+
+export async function connectSessionAttentionStore(): Promise<() => void> {
+  const store = useSessionAttentionStore.getState();
+  store.hydrateSeen();
+  let initializing = true;
+  const buffered: SessionStatusChangedPayload[] = [];
+  const unlisten = await onSessionStatusChanged((payload) => {
+    if (initializing) {
+      buffered.push(payload);
+      return;
+    }
+    useSessionAttentionStore.getState().applyChanged(payload);
+  });
+  try {
+    const snapshot = await getSessionStatusSnapshot();
+    useSessionAttentionStore.getState().applySnapshot(snapshot);
+  } catch (error) {
+    console.warn("[attention] Failed to load session status snapshot", error);
+  } finally {
+    initializing = false;
+    for (const payload of buffered) {
+      useSessionAttentionStore.getState().applyChanged(payload);
+    }
+  }
+  return unlisten;
+}

@@ -1,0 +1,476 @@
+import { useEffect, useRef, type RefObject } from "react";
+import { useSettingsStore } from "../stores/settingsStore";
+import { useUiStore } from "../stores/uiStore";
+import { useWorkspaceListStore } from "../stores/workspaceListStore";
+import { usePaneDragStore } from "../stores/paneDragStore";
+import { useSavepointDragStore } from "../stores/savepointDragStore";
+import { useDetachedDockStore } from "../stores/detachedDockStore";
+import { composerHoldsFocus, focusController } from "../lib/focusController";
+import { isRestorableTab } from "../lib/tabLifecycle";
+import { isStartupSessionPending } from "../lib/startupSessionGate";
+import { isTearoutSessionDormant } from "../lib/tearout/sessionAttachment";
+import { createPaneHoverState, decidePaneHoverFocus, paneHoverSnapshotAllowsFocus,
+  PANE_HOVER_FOCUS_DWELL_MS, samePaneHoverTarget, paneHoverStructureKey,
+  type PaneHoverCandidate, type PaneHoverEvent, type PaneHoverSnapshot, type PaneHoverTarget } from "../lib/paneHoverFocus";
+
+// Resident overlay roots (the grouping flight layers) are always mounted and never modal.
+const BLOCKERS = ".cmux-overlay-backdrop,[data-cmux-overlay-root]:not([data-pane-hover-focus-ignore]),[role='dialog'],[role='alertdialog'],[aria-modal='true'],"
+  + ".cmux-popover-panel,[role='menu'],[data-cmux-native-webview-occluder],[data-pane-hover-focus-blocker]";
+const BLOCKER_ATTRIBUTES = new Set(["class", "role", "aria-modal", "data-cmux-overlay-root",
+  "data-pane-hover-focus-ignore", "data-cmux-native-webview-occluder", "data-pane-hover-focus-blocker"]);
+
+/** Match the same selector union while replaying recorded attributes, without mutating the DOM. */
+function matchesBlockerAttributes(element: Element, values: Map<string, string | null>): boolean {
+  const attr = (name: string) => values.has(name) ? values.get(name)! : element.getAttribute(name);
+  const classes = (attr("class") ?? "").split(/[ \t\n\f\r]+/), role = attr("role");
+  return classes.includes("cmux-overlay-backdrop") || classes.includes("cmux-popover-panel")
+    || (attr("data-cmux-overlay-root") !== null && attr("data-pane-hover-focus-ignore") === null)
+    || role === "dialog" || role === "alertdialog" || role === "menu" || attr("aria-modal") === "true"
+    || attr("data-cmux-native-webview-occluder") !== null || attr("data-pane-hover-focus-blocker") !== null;
+}
+
+const VISIBILITY_ATTRIBUTES = new Set(["hidden", "inert", "aria-hidden", "style", "class"]);
+const SUBTREE_SEARCH_LIMIT = 8;
+
+/** Only a known xterm DOM-renderer row of leaf glyph spans can skip descendant selectors. */
+function terminalRenderRow(node: Element, parent: Element): boolean {
+  return node.tagName === "DIV" && parent.classList.contains("xterm-rows") && !!parent.closest(".xterm")
+    && [...node.children].every((cell) => cell.tagName === "SPAN" && !cell.firstElementChild && !cell.matches(BLOCKERS));
+}
+
+const EXCLUDED = "button,a,input,textarea:not(.xterm-helper-textarea),select,iframe,embed,object,[contenteditable],[role='button'],[role='separator'],"
+  + "[draggable='true'],[data-dnd-drag-handle],[data-pane-drag-handle],[data-terminal-transcript-panel],[data-terminal-history],[data-terminal-search],[data-agent-resume-recovery],"
+  + "[hidden],[inert],[aria-hidden='true'],[data-composer-session],[data-declared-tab-placeholder],[data-dormant-transfer-placeholder]";
+
+interface PaneHoverRegistration {
+  enabled: boolean;
+  workspaceId: string;
+  paneId: string;
+  tabId: string;
+  sessionId: string;
+  kind: PaneHoverTarget["kind"];
+  onActivate: (focusGuard: () => boolean, commitHoverSelection: (commit: () => void) => void, onHoverFocusAborted: () => void) => void;
+}
+interface Surface { element: HTMLElement; current: () => PaneHoverRegistration }
+interface FocusToken { phase: "pending" | "committed"; valid: boolean; focusGuard?: () => boolean; candidate: PaneHoverCandidate; surface: Surface; activeId?: string | null; focusRevision?: number }
+
+function visible(element: HTMLElement, closingOverlay = false): boolean {
+  if (!element.isConnected) return false;
+  if (closingOverlay) return true;
+  for (let node: HTMLElement | null = element; node; node = node.parentElement) {
+    if (node.hidden || node.hasAttribute("inert") || node.getAttribute("aria-hidden") === "true") return false;
+    const style = node.ownerDocument.defaultView!.getComputedStyle(node);
+    if (style.display === "none" || style.visibility === "hidden" || style.visibility === "collapse") return false;
+  }
+  return Array.from(element.getClientRects()).some((rect) => rect.width > 0 && rect.height > 0);
+}
+
+function editable(element: Element): boolean {
+  for (let node: Element | null = element; node; node = node.parentElement) {
+    const value = node.getAttribute("contenteditable");
+    if (value === "false") return false;
+    if (value === "" || value === "true" || value === "plaintext-only") return true;
+  }
+  return (element as HTMLElement).isContentEditable === true;
+}
+
+class PaneHoverRuntime {
+  private surfaces = new Map<HTMLElement, Surface>();
+  private state;
+  private timer: number | undefined;
+  private cleanup: Array<() => void> = [];
+  private observer: MutationObserver;
+  private resize: ResizeObserver | undefined;
+  private blockerRevision = 0;
+  private visibleBlockers: Set<HTMLElement>;
+  private owned: FocusToken | undefined;
+  private committing = false;
+  private buttons = 0;
+  private modified = false;
+  private capture = false;
+  private focused: boolean;
+  private lastFocus: Element | null;
+
+  constructor(private doc: Document) {
+    const win = doc.defaultView!;
+    this.focused = doc.hasFocus();
+    this.lastFocus = doc.activeElement;
+    this.state = createPaneHoverState(this.lastFocus?.matches(".xterm-helper-textarea") ? "unknown" : "known");
+    const listen = (target: EventTarget, name: string, fn: (event: Event) => void, passive = false) => {
+      function paneHoverFocusListener(event: Event) { fn(event); }
+      target.addEventListener(name, paneHoverFocusListener, { capture: true, passive });
+      this.cleanup.push(() => target.removeEventListener(name, paneHoverFocusListener, true));
+    };
+    listen(doc, "pointermove", (event) => this.move(event as PointerEvent), true);
+    listen(doc, "pointerenter", (event) => {
+      const surface = this.resolve(event.target);
+      if (surface) this.send({ type: "enter", surface: surface.element });
+    }, true);
+    listen(doc, "pointerleave", (event) => {
+      const e = event as PointerEvent;
+      const surface = this.resolve(e.target);
+      if (surface && this.resolve(e.relatedTarget) !== surface) {
+        if (this.owned?.phase === "pending" && this.owned.surface === surface) this.killToken();
+        this.send({ type: "leave", surface: surface.element });
+      }
+    }, true);
+    listen(doc, "pointerdown", (event) => {
+      this.buttons = (event as PointerEvent).buttons || 1;
+      this.invalidate("down");
+    });
+    for (const name of ["pointerup", "pointercancel", "lostpointercapture"]) listen(doc, name, () => {
+      this.buttons = 0; this.capture = false;
+      this.invalidate(name === "pointerup" ? "up" : "cancel");
+    });
+    listen(doc, "gotpointercapture", () => { this.capture = true; this.invalidate(); });
+    listen(doc, "compositionstart", () => this.invalidate("compositionstart"));
+    listen(doc, "compositionend", () => this.invalidate("compositionend"));
+    listen(doc, "keydown", (event) => {
+      const e = event as KeyboardEvent;
+      this.modified = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
+      this.killToken();
+      this.send({ type: "key", composing: e.isComposing || e.key === "Process" || e.keyCode === 229 });
+    });
+    listen(doc, "keyup", (event) => {
+      const e = event as KeyboardEvent;
+      this.modified = e.altKey || e.ctrlKey || e.metaKey || e.shiftKey;
+      this.invalidate();
+    });
+    listen(doc, "focusin", () => {
+      const active = doc.activeElement;
+      if (active === this.lastFocus) return;
+      this.lastFocus = active;
+      // Our own registered terminal/search focus is not a newer explicit selection.
+      const token = this.owned, target = token?.candidate.snapshot.target;
+      const ownInput = target?.kind === "terminal"
+        ? active?.matches(".xterm-helper-textarea") && active.closest("[data-session-id]")?.getAttribute("data-session-id") === target.sessionId
+        : active?.matches("input") && !!active.closest("[data-launcher-pane]");
+      const ownFocus = token?.valid && ownInput && token.surface.element.closest("[data-dnd-pane-id]")?.contains(active);
+      if (!ownFocus) this.invalidate("focuschange");
+    });
+    listen(doc, "focusout", () => {
+      this.send({ type: "invalidate" });
+    });
+    listen(win, "blur", (event) => {
+      if (event.target !== win && (event.target as Window | null)?.document !== doc) return;
+      this.focused = false; this.buttons = 0; this.capture = false; this.invalidate("blur");
+    });
+    listen(win, "focus", (event) => {
+      if (event.target !== win && (event.target as Window | null)?.document !== doc) return;
+      this.focused = true; this.invalidate("focus");
+    });
+    listen(doc, "visibilitychange", () => { this.buttons = 0; this.capture = false; this.invalidate("visibility"); });
+    for (const name of ["mycmux:workspace-visibility-change", "mycmux:terminal-layout-change"]) {
+      listen(win, name, () => this.invalidate());
+    }
+    const changed = () => this.invalidate();
+    const runtime = this;
+    // These subscriptions belong to the enabled runtime, never to click mode.
+    function paneHoverFocusStoreChanged() { changed(); }
+    function paneHoverFocusWorkspaceChanged(next: ReturnType<typeof useWorkspaceListStore.getState>, prev: ReturnType<typeof useWorkspaceListStore.getState>) {
+      if (paneHoverStructureKey(next) !== paneHoverStructureKey(prev)) changed();
+    }
+    function paneHoverFocusUiChanged(next: ReturnType<typeof useUiStore.getState>, prev: ReturnType<typeof useUiStore.getState>) {
+      if (!runtime.committing && (next.activePaneId !== prev.activePaneId || next.focusRevision !== prev.focusRevision
+        || next.zoomedPaneId !== prev.zoomedPaneId)) changed();
+    }
+    function paneHoverFocusSettingsChanged(next: { paneFocusMode: string }, prev: { paneFocusMode: string }) {
+      if (next.paneFocusMode !== prev.paneFocusMode) changed();
+    }
+    this.cleanup.push(useWorkspaceListStore.subscribe(paneHoverFocusWorkspaceChanged));
+    this.cleanup.push(useUiStore.subscribe(paneHoverFocusUiChanged));
+    this.cleanup.push(usePaneDragStore.subscribe(paneHoverFocusStoreChanged));
+    this.cleanup.push(useSavepointDragStore.subscribe(paneHoverFocusStoreChanged));
+    this.cleanup.push(useDetachedDockStore.subscribe(paneHoverFocusStoreChanged));
+    this.cleanup.push(useSettingsStore.subscribe(paneHoverFocusSettingsChanged));
+    this.visibleBlockers = this.readVisibleBlockers();
+    this.observer = new win.MutationObserver((records) => {
+      // Keep even a blocker added and removed in one batch as a cancellation boundary.
+      const childListChanged = records.some((r) => {
+        if (r.type !== "childList") return false;
+        const target = r.target as Element;
+        return [...r.addedNodes, ...r.removedNodes].some((node) => node instanceof win.Element
+          && (node.matches(BLOCKERS) || (node.firstElementChild !== null && !terminalRenderRow(node, target)
+            && !!node.querySelector(BLOCKERS))));
+      });
+      if (childListChanged) {
+        // Cancellation and a final collection refresh are certain; do not search attribute subtrees.
+        this.visibleBlockers = this.readVisibleBlockers();
+        this.blockerRevision++; this.invalidate(); return;
+      }
+      const targets = new Map<Element, { blocker: boolean; relevant: boolean; changes: number; canUnhide: Set<string> }>();
+      for (const record of records) {
+        if (record.type !== "attributes") continue;
+        const target = record.target as Element;
+        let facts = targets.get(target);
+        if (!facts) {
+          const blocker = target.matches(BLOCKERS);
+          facts = { blocker, relevant: blocker || [...this.visibleBlockers].some((element) => target.contains(element)),
+            changes: 0, canUnhide: new Set() };
+          targets.set(target, facts);
+        }
+        const name = record.attributeName!;
+        if (((name === "hidden" || name === "inert") && record.oldValue === null)
+          || (name === "aria-hidden" && record.oldValue !== "true")) facts.canUnhide.add(name);
+      }
+      // Decide the budget before any subtree search. Duplicate targets are already coalesced.
+      const subtrees = [...targets].filter(([target, facts]) => !facts.relevant && target.firstElementChild !== null)
+        .map(([target]) => target);
+      let allBlockers: NodeListOf<HTMLElement> | undefined;
+      if (subtrees.length >= SUBTREE_SEARCH_LIMIT
+        || subtrees.some((target, i) => subtrees.slice(0, i).some((other) => target.contains(other) || other.contains(target)))) {
+        allBlockers = doc.querySelectorAll<HTMLElement>(BLOCKERS);
+        for (const target of subtrees) targets.get(target)!.relevant = [...allBlockers].some((element) => target.contains(element));
+      } else {
+        for (const target of subtrees) targets.get(target)!.relevant = !!target.querySelector(BLOCKERS);
+      }
+      let membershipChanged = false;
+      const previousAttributes = new Map<Element, Map<string, string | null>>();
+      let styleProbe: CSSStyleDeclaration | undefined;
+      const styleSignatures = new Map<string | null, string>();
+      const visibilityValue = (name: string, value: string | null) => {
+        if (name === "hidden" || name === "inert") return value !== null;
+        if (name === "aria-hidden") return value === "true";
+        if (name !== "style") return value;
+        if (!styleSignatures.has(value)) {
+          styleProbe ??= doc.createElement("span").style;
+          styleProbe.cssText = value ?? "";
+          // Opacity never changes visible()'s gates. Other declarations may affect layout or CSS variables.
+          styleSignatures.set(value, JSON.stringify(Array.from({ length: styleProbe.length }, (_, i) => styleProbe!.item(i))
+            .filter((property) => property !== "opacity")
+            .map((property) => [property, styleProbe!.getPropertyValue(property), styleProbe!.getPropertyPriority(property)])));
+        }
+        return styleSignatures.get(value)!;
+      };
+      // Undo attributes without touching live DOM. Keep both selector and visibility history.
+      for (let i = records.length - 1; i >= 0; i--) {
+        const record = records[i];
+        if (record.type !== "attributes") continue;
+        const target = record.target as Element, facts = targets.get(target)!, name = record.attributeName!;
+        let values = previousAttributes.get(target);
+        const afterValue = values?.has(name) ? values.get(name)! : target.getAttribute(name);
+        const afterBlocker = BLOCKER_ATTRIBUTES.has(name)
+          ? values ? matchesBlockerAttributes(target, values) : facts.blocker : false;
+        if (!values) { values = new Map(); previousAttributes.set(target, values); }
+        values.set(name, record.oldValue);
+        if (BLOCKER_ATTRIBUTES.has(name) && afterBlocker !== matchesBlockerAttributes(target, values)) {
+          membershipChanged = true; break;
+        }
+        if (facts.relevant && VISIBILITY_ATTRIBUTES.has(name) && afterValue !== record.oldValue
+          && visibilityValue(name, afterValue) !== visibilityValue(name, record.oldValue)) facts.changes++;
+      }
+      if (!membershipChanged && ![...targets.values()].some((facts) => facts.relevant)) return;
+      allBlockers ??= doc.querySelectorAll<HTMLElement>(BLOCKERS);
+      const blockers = this.readVisibleBlockers(allBlockers);
+      const visibilityChanged = blockers.size !== this.visibleBlockers.size
+        || [...blockers].some((element) => !this.visibleBlockers.has(element));
+      const visibilityExcursion = !membershipChanged && [...allBlockers].some((blocker) => {
+        // A fixed hidden/inert/aria-hidden gate on the path proves it could never have shown.
+        let changes = 0;
+        for (let node: Element | null = blocker; node; node = node.parentElement) {
+          const facts = targets.get(node);
+          changes += facts?.changes ?? 0;
+          const canUnhide = facts?.canUnhide;
+          if ((node.hasAttribute("hidden") && !canUnhide?.has("hidden"))
+            || (node.hasAttribute("inert") && !canUnhide?.has("inert"))
+            || (node.getAttribute("aria-hidden") === "true" && !canUnhide?.has("aria-hidden"))) return false;
+        }
+        // Two effective changes on one blocker path may expose it between equal final visible sets.
+        return changes >= 2;
+      });
+      this.visibleBlockers = blockers;
+      if (membershipChanged || visibilityExcursion || visibilityChanged) { this.blockerRevision++; this.invalidate(); }
+    });
+    this.observer.observe(doc.documentElement, { subtree: true, childList: true, attributes: true, attributeOldValue: true,
+      attributeFilter: ["class", "role", "aria-modal", "style", "hidden", "inert", "aria-hidden",
+        "data-cmux-overlay-root", "data-pane-hover-focus-ignore", "data-cmux-native-webview-occluder", "data-pane-hover-focus-blocker"] });
+    if (win.ResizeObserver) this.resize = new win.ResizeObserver(() => this.invalidate());
+  }
+
+  register(surface: Surface): () => void {
+    this.surfaces.set(surface.element, surface);
+    this.resize?.observe(surface.element);
+    this.invalidate();
+    return () => {
+      this.surfaces.delete(surface.element);
+      this.resize?.unobserve(surface.element);
+      this.invalidate();
+      if (this.surfaces.size === 0) {
+        this.observer.disconnect(); this.resize?.disconnect();
+        for (const clean of this.cleanup) clean();
+        runtimes.delete(this.doc);
+      }
+    };
+  }
+
+  private resolve(target: EventTarget | null): Surface | undefined {
+    const win = this.doc.defaultView!;
+    let element = target instanceof win.Element ? target : null;
+    const origin = element;
+    while (element) {
+      const surface = this.surfaces.get(element as HTMLElement);
+      if (surface) {
+        const excluded = origin?.closest(EXCLUDED);
+        if (excluded && surface.element.contains(excluded)) return;
+        return surface;
+      }
+      element = element.parentElement;
+    }
+  }
+
+  private readVisibleBlockers(elements: Iterable<HTMLElement> = this.doc.querySelectorAll<HTMLElement>(BLOCKERS)): Set<HTMLElement> {
+    return new Set([...elements].filter((element) =>
+      visible(element, element.matches(".cmux-overlay-backdrop,[data-cmux-overlay-root]"))));
+  }
+
+  private snapshot(surface?: Surface, ownFocus = false): PaneHoverSnapshot {
+    const ui = useUiStore.getState(), list = useWorkspaceListStore.getState();
+    const registration = surface?.current();
+    const ws = registration && list.getWorkspace(registration.workspaceId);
+    const pane = ws?.panes.find((p) => p.id === registration?.paneId);
+    const tab = pane?.tabs.find((t) => t.id === pane.activeTabId) ?? pane?.tabs[0];
+    const target = surface && registration ? { ...registration, surface: surface.element } : null;
+    const normal = tab && isRestorableTab(tab) && !isStartupSessionPending(tab.sessionId) && !isTearoutSessionDormant(tab.sessionId);
+    const exact = !!registration?.enabled && !!normal && tab.id === registration.tabId && tab.sessionId === registration.sessionId
+      && (registration.kind === "launcher" ? tab.type === "launcher" : tab.type === undefined || tab.type === "terminal")
+      && surface?.element.closest("[data-dnd-pane-id]")?.getAttribute("data-dnd-pane-id") === registration.paneId;
+    const active = this.doc.activeElement;
+    const ownInput = ownFocus && registration?.kind === "launcher" && surface?.element.parentElement?.contains(active);
+    const protectedFocus = !!surface && !!active && !ownInput && (composerHoldsFocus() || editable(active)
+      || (active.matches("input,textarea,select,iframe,embed,object") && !active.matches(".xterm-helper-textarea")));
+    const blocked = !!surface && this.readVisibleBlockers().size > 0;
+    return { mode: useSettingsStore.getState().paneFocusMode, target: exact ? target : null,
+      activePaneId: ui.activePaneId, focusRevision: ui.focusRevision, structureKey: paneHoverStructureKey(list),
+      zoomedPaneId: ui.zoomedPaneId, blockerRevision: this.blockerRevision,
+      windowFocused: this.focused && this.doc.hasFocus(), documentVisible: this.doc.visibilityState === "visible",
+      connected: !!surface?.element.isConnected, visible: !!surface && visible(surface.element)
+        && list.activeWorkspaceId === registration?.workspaceId && (ui.zoomedPaneId === null || ui.zoomedPaneId === registration?.paneId),
+      samePane: !!pane && (pane.sessionId === ui.activePaneId || pane.tabs.some((t) => t.sessionId === ui.activePaneId)),
+      dragging: !!(usePaneDragStore.getState().item || useSavepointDragStore.getState().item || useDetachedDockStore.getState().active),
+      captured: this.capture || this.buttons !== 0 || this.modified,
+      blocked, editorFocused: protectedFocus, selected: this.doc.getSelection()?.isCollapsed === false };
+  }
+
+  private move(event: PointerEvent): void {
+    this.buttons = event.buttons; this.modified = event.altKey || event.ctrlKey || event.metaKey || event.shiftKey;
+    if (event.target instanceof this.doc.defaultView!.Element && event.target.hasPointerCapture?.(event.pointerId)) this.capture = true;
+    const pointer = this.state.pointer;
+    const surface = this.resolve(event.target);
+    const cheapReject = event.pointerType !== "mouse" || event.buttons !== 0 || this.modified
+      || this.state.down || this.state.ime !== "known";
+    const pending = this.owned?.phase === "pending" ? this.owned : undefined;
+    if (pending) {
+      if (!cheapReject && surface === pending.surface && pending.focusGuard?.()) {
+        // Acquisition already owns this dwell. Movement inside it only updates the hit point.
+        this.state = { ...this.state, pointer: { id: event.pointerId, x: event.clientX, y: event.clientY }, inside: surface.element };
+        return;
+      }
+      this.killToken();
+    }
+    if (!this.state.candidate && pointer?.id === event.pointerId
+      && pointer.x === event.clientX && pointer.y === event.clientY) return;
+    // Detailed DOM gates only at arm/dwell/acquisition; same-surface motion retains its start.
+    const c = this.state.candidate;
+    const snapshot = c && surface?.element === c.snapshot.target?.surface
+      ? c.snapshot : this.snapshot(cheapReject ? undefined : surface);
+    this.send({ type: "move", snapshot, now: this.doc.defaultView!.performance.now(), pointerId: event.pointerId,
+      x: event.clientX, y: event.clientY, movementX: event.movementX, movementY: event.movementY,
+      pointerType: event.pointerType, buttons: event.buttons, modified: this.modified });
+  }
+
+  private send(event: PaneHoverEvent): void {
+    const result = decidePaneHoverFocus(this.state, event);
+    this.state = result.state;
+    if (result.effect.type === "cancel") this.clearTimer();
+    if (result.effect.type === "arm") {
+      this.killToken(); this.clearTimer();
+      const runtime = this;
+      this.timer = this.doc.defaultView!.setTimeout(function paneHoverFocusDwell() {
+        runtime.timer = undefined;
+        const pointer = runtime.state.pointer;
+        const hit = pointer && runtime.doc.elementFromPoint(pointer.x, pointer.y);
+        const surface = runtime.resolve(hit || null);
+        runtime.send({ type: "dwell", now: runtime.doc.defaultView!.performance.now(), snapshot: runtime.snapshot(surface) });
+      }, PANE_HOVER_FOCUS_DWELL_MS);
+    }
+    if (result.effect.type === "activate") this.activate(result.effect.candidate);
+  }
+
+  private activate(candidate: PaneHoverCandidate): void {
+    const surface = this.surfaces.get(candidate.snapshot.target?.surface as HTMLElement);
+    if (!surface) return;
+    const token: FocusToken = { phase: "pending", valid: true, candidate, surface };
+    this.owned = token;
+    const guard = () => {
+      if (!token.valid || this.owned !== token || this.state.down || this.state.ime !== "known") return false;
+      try {
+        if (token.phase === "pending") {
+          const pointer = this.state.pointer;
+          if (!pointer || this.resolve(this.doc.elementFromPoint(pointer.x, pointer.y)) !== surface) return false;
+        }
+        const s = this.snapshot(surface, true);
+        const expectedId = token.activeId === undefined ? candidate.snapshot.activePaneId : token.activeId;
+        const expectedRevision = token.focusRevision ?? candidate.snapshot.focusRevision;
+        return paneHoverSnapshotAllowsFocus({ ...s, samePane: false })
+          && samePaneHoverTarget(s.target, candidate.snapshot.target) && s.activePaneId === expectedId
+          && s.focusRevision === expectedRevision && s.structureKey === candidate.snapshot.structureKey
+          && s.zoomedPaneId === candidate.snapshot.zoomedPaneId && s.blockerRevision === candidate.snapshot.blockerRevision;
+      } catch {
+        return false;
+      }
+    };
+    token.focusGuard = guard;
+    if (!guard()) { this.killToken(); return; }
+    const recordCommit = () => {
+      const ui = useUiStore.getState();
+      token.activeId = ui.activePaneId; token.focusRevision = ui.focusRevision;
+      if (ui.activePaneId !== candidate.snapshot.target?.sessionId) this.killToken();
+      else token.phase = "committed";
+    };
+    const commitHoverSelection = (commit: () => void) => {
+      if (!guard()) return;
+      this.committing = true;
+      try { commit(); recordCommit(); }
+      finally { this.committing = false; }
+    };
+    this.committing = true;
+    try { surface.current().onActivate(guard, commitHoverSelection, () => { if (this.owned === token) this.killToken(); }); }
+    finally { this.committing = false; }
+    // Launcher claims synchronously. Terminal remains owned by A until focus is acquired.
+    if (useUiStore.getState().activePaneId === candidate.snapshot.target?.sessionId) recordCommit();
+  }
+
+  private killToken(): void {
+    const token = this.owned;
+    if (!token) return;
+    token.valid = false;
+    this.owned = undefined;
+    if (token.focusGuard) focusController.cancelHoverFocus(token.focusGuard);
+  }
+  private clearTimer(): void {
+    if (this.timer !== undefined) this.doc.defaultView!.clearTimeout(this.timer);
+    this.timer = undefined;
+  }
+  private invalidate(type: "invalidate" | "down" | "up" | "cancel" | "blur" | "focus" | "visibility"
+    | "compositionstart" | "compositionend" | "focuschange" = "invalidate"): void {
+    this.killToken(); this.send({ type });
+  }
+}
+
+const runtimes = new WeakMap<Document, PaneHoverRuntime>();
+
+/** Registration only: click mode allocates no hover runtime resources. */
+export function usePaneHoverFocus(ref: RefObject<HTMLElement | null>, registration: PaneHoverRegistration): boolean {
+  const mode = useSettingsStore((s) => s.paneFocusMode);
+  const latest = useRef(registration); latest.current = registration;
+  const enabled = registration.enabled && mode === "hover";
+  useEffect(() => {
+    const element = ref.current;
+    if (!enabled || !element || !element.closest("[data-dnd-pane-id]")) return;
+    const doc = element.ownerDocument;
+    let runtime = runtimes.get(doc);
+    if (!runtime) { runtime = new PaneHoverRuntime(doc); runtimes.set(doc, runtime); }
+    return runtime.register({ element, current: () => latest.current });
+  }, [ref, enabled, registration.workspaceId, registration.paneId, registration.tabId, registration.sessionId, registration.kind]);
+  return enabled;
+}
