@@ -73,6 +73,7 @@ import {
 } from "./dashboardModel";
 import { orderCardsByAttentionSection } from "./dashboardAttentionOrder";
 import { dashboardStrings } from "./dashboardStrings";
+import { stateLabels } from "./stateLabels";
 import {
   chooseOption,
   isInterventionAccepted,
@@ -80,6 +81,7 @@ import {
   useInterventionFeedbackStore,
 } from "./interventionRouting";
 import { ReplyComposer } from "./ReplyComposer";
+import { QuestionCard } from "./QuestionCard";
 import { WorkOrderContract } from "./WorkOrderContract";
 import { targetKey } from "../../lib/livebrief";
 import { LayoutMinimapPanel } from "./LayoutMinimapPanel";
@@ -89,6 +91,8 @@ import { chatColumnColor } from "../../lib/chatColumnColors";
 import ErrorBoundary from "../common/ErrorBoundary";
 import BrowserPane from "../workspace/BrowserPane";
 import "./DashboardView.css";
+import "./DashboardChatSurface.css";
+import { Columns2 } from "lucide-react";
 
 /** 番号キーで撃てる選択肢。ここを増やすなら dashboardStrings.numberKeyHint も直す。 */
 const NUMBER_KEYS = ["1", "2", "3"];
@@ -138,6 +142,8 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
   const searchRef = useRef<HTMLInputElement>(null);
   const pendingSearchFocusRef = useRef(false);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const yourTurnComposerRef = useRef<HTMLTextAreaElement>(null);
+  const yourTurnTabId = useDashboardViewStore((state) => state.yourTurnTabId);
   const resizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const suppressDashboardListClickRef = useRef(false);
   const [now, setNow] = useState(() => Date.now());
@@ -212,11 +218,13 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
   const stallsBySession = useStallStore((state) => state.entries);
   const attentionState = useSessionAttentionStore(useShallow((state) => ({
     attentionBySession: state.attentionBySession,
+    statusSignalsBySession: state.statusSignalsBySession,
     dormantCompletionsBySession: state.dormantCompletionsBySession,
     seenAttentionByTab: state.seenAttentionByTab,
     doneMarkByTab: state.doneMarkByTab,
   })));
   const briefsBySession = useLiveBriefStore((state) => state.briefsBySession);
+  const observationsBySession = useLiveBriefStore((state) => state.observationsBySession);
   const eventsBySession = useLiveBriefStore((state) => state.eventsBySession);
   const eventsFetchedAtBySession = useLiveBriefStore((state) => state.eventsFetchedAtBySession);
   const listEventsBySession = useLiveBriefStore((state) => state.listEventsBySession);
@@ -230,6 +238,8 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
     lastLogBySession: metadataState.lastLog,
     lastLogAtBySession: metadataState.lastLogAt,
     attentionBySession: attentionState.attentionBySession,
+    statusSignalsBySession: attentionState.statusSignalsBySession,
+    observationsBySession,
     dormantCompletionsBySession: attentionState.dormantCompletionsBySession,
     seenAttentionByTab: attentionState.seenAttentionByTab,
     doneMarkByTab: attentionState.doneMarkByTab,
@@ -238,7 +248,7 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
     delegationParents,
     now,
     hasTerminalBuffer,
-  }), [attentionState, briefsBySession, delegationParents, metadataState, now, stallsBySession, workspaces]);
+  }), [attentionState, briefsBySession, observationsBySession, delegationParents, metadataState, now, stallsBySession, workspaces]);
   const attentionFactSources = useMemo<AttentionFactSource[]>(() => cards.map((card) => ({
     sessionId: card.tab.sessionId,
     label: card.label,
@@ -247,6 +257,7 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
     now: card.now,
     queuedInput: card.stall?.reason === "queued_input" ? card.stall.detail ?? null : null,
   })), [cards]);
+  const yourTurnCard = cards.find((card) => card.tab.id === yourTurnTabId);
   const minimapDisplayStateByTabId = useMemo(() => new Map(cards.map((card) => [card.tab.id, resolveDisplayState(card)] as const)), [cards]);
   const filteredCards = useMemo(() => applyDashboardFilters(cards, {
     query: viewState.query,
@@ -1139,6 +1150,20 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
   } as const;
 
   return <div ref={rootRef} tabIndex={-1} role="region" aria-label={dashboardStrings.viewAriaLabel} className="cmux-dashboard-view" onPointerDownCapture={beginDashboardPointerDrag} onClickCapture={suppressDashboardListClick}>
+    {yourTurnCard ? <section className="cmux-your-turn-overlay" aria-label={`あなたの番 — ${yourTurnCard.label}`}>
+      <div className="cmux-your-turn-overlay-head"><strong>{yourTurnCard.label} · {stateLabels(resolveDisplayState(yourTurnCard)).primary}</strong>
+        <button type="button" className="cmux-your-turn" onClick={() => useDashboardViewStore.setState({ yourTurnTabId: null })}>一覧に戻る</button></div>
+      <QuestionCard brief={yourTurnCard.brief} events={eventsBySession[yourTurnCard.tab.sessionId]}
+        targetLabel={yourTurnCard.label} sessionId={yourTurnCard.tab.sessionId} attention={yourTurnCard.attention}
+        onFocusComposer={(brief) => {
+          const composer = useComposerStore.getState();
+          composer.setCommandKind(yourTurnCard.tab.sessionId, "answer-forward");
+          composer.setQuestionGuard(yourTurnCard.tab.sessionId, brief?.promptEventId
+            ? { questionId: brief.promptEventId, revision: brief.ptyInputRevision } : null);
+          yourTurnComposerRef.current?.focus();
+        }} />
+      <ReplyComposer card={yourTurnCard} inputRef={yourTurnComposerRef} mentionTargets={cards} questionActive />
+    </section> : null}
     <AskStrip items={askItems} onSelect={(item) => selectQuestion(item.tabId, item.sessionId)} />
     <WatchStatusRow now={now} />
     <div
@@ -1321,13 +1346,15 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
           </div>
         </div>
         <div className="cmux-dashboard-composer-destination" aria-live="polite">
-          <span>{activeColumnIsInbox
+          <span hidden={chatColumnTabIds.length === 1 && !!activeColumnCard}>{activeColumnIsInbox
             ? `入力先: ${dashboardStrings.attentionTitle}（${activeChatColumn + 1}/${chatColumnTabIds.length}列）`
             : activeColumnIsPreview
               ? `入力先: ${viewState.previewColumn?.label ?? dashboardStrings.previewColumnTitle}（${activeChatColumn + 1}/${chatColumnTabIds.length}列）`
             : activeColumnCard
               ? `入力先: ${activeColumnCard.label}（${activeChatColumn + 1}/${chatColumnTabIds.length}列）`
               : dashboardStrings.detailEmpty}</span>
+          <details className="cmux-dashboard-column-options">
+          <summary aria-label={dashboardStrings.chatColumnLimitGroupLabel} title={dashboardStrings.chatColumnLimitGroupLabel}><Columns2 size={15} aria-hidden="true" /></summary>
           <div role="group" aria-label={dashboardStrings.chatColumnLimitGroupLabel} className="cmux-dashboard-column-limit">
             {CHAT_COLUMN_LIMIT_CHOICES.map((limit) => <button
               key={limit}
@@ -1338,6 +1365,7 @@ export function DashboardView({ onClose }: { onClose: () => void }) {
               onClick={() => viewState.setChatColumnLimit(limit)}
             >{limit}</button>)}
           </div>
+          </details>
         </div>
         <WorkOrderContract
           card={activeColumnCard}

@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { KeyboardEvent, PointerEvent as ReactPointerEvent, RefObject } from "react";
+import { ArrowUp } from "lucide-react";
 
 import { handleSocketCommand } from "../layout/socketCommands";
 import { useLiveBriefStore } from "../../stores/liveBriefStore";
@@ -39,6 +40,11 @@ import { useAskQuestionStore } from "../../stores/askQuestionStore";
 interface PaneSendTextOutcome {
   confirmed?: boolean;
   reason?: string;
+  sent?: boolean;
+  message?: string;
+  textWritten?: boolean;
+  enterWritten?: boolean;
+  writeMayHaveOccurred?: boolean;
 }
 
 interface ComposerNote {
@@ -144,6 +150,39 @@ export function ReplyComposer({ card, inputRef, mentionTargets, questionActive =
   const dragItem = usePaneDragStore((state) => state.item);
   const dragPointer = usePaneDragStore((state) => state.pointer);
   const [dropOver, setDropOver] = useState(false);
+
+  const fitInput = useCallback(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    const style = getComputedStyle(input);
+    const border = (Number.parseFloat(style.borderTopWidth) || 0) + (Number.parseFloat(style.borderBottomWidth) || 0);
+    const minimum = Number.parseFloat(style.minHeight) || 42;
+    const maximum = Number.parseFloat(style.maxHeight) || 160;
+    input.style.height = "0px";
+    const height = input.scrollHeight + border;
+    input.style.height = `${Math.max(minimum, Math.min(maximum, height))}px`;
+    input.style.overflowY = height > maximum ? "auto" : "hidden";
+  }, [inputRef]);
+
+  useLayoutEffect(fitInput, [draft, sessionId, fitInput]);
+
+  useLayoutEffect(() => {
+    const input = inputRef.current;
+    if (!input) return;
+    let width = input.getBoundingClientRect().width;
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(() => {
+      const nextWidth = input.getBoundingClientRect().width;
+      if (nextWidth === width) return;
+      width = nextWidth;
+      fitInput();
+    });
+    observer?.observe(input);
+    if (!observer) window.addEventListener("resize", fitInput);
+    return () => {
+      observer?.disconnect();
+      if (!observer) window.removeEventListener("resize", fitInput);
+    };
+  }, [fitInput, inputRef]);
 
   const mentionCandidates = useMemo(() => buildMentionCandidates(mentionTargets.map((target) => {
     const displayState = resolveDisplayState(target);
@@ -275,10 +314,14 @@ export function ReplyComposer({ card, inputRef, mentionTargets, questionActive =
         text: body,
         enter: true,
       }) as PaneSendTextOutcome | null;
+      if (outcome?.sent === false) return {
+        state: outcome.textWritten || outcome.writeMayHaveOccurred ? "unconfirmed" : "blocked",
+        detail: outcome.message ?? dashboardStrings.composerRetryRouteChanged,
+      };
       if (outcome?.confirmed === true) return { state: "confirmed", detail: dashboardStrings.sendConfirmedOnScreen };
       return {
         state: "unconfirmed",
-        detail: unconfirmedSendText(outcome?.reason),
+        detail: outcome?.message ?? unconfirmedSendText(outcome?.reason),
       };
     } catch (error) {
       return { state: "failed", detail: `${dashboardStrings.sendFailedBeforeWrite} (${errorText(error)})` };
@@ -337,15 +380,24 @@ export function ReplyComposer({ card, inputRef, mentionTargets, questionActive =
         text: body,
         enter: true,
       }) as PaneSendTextOutcome | null;
+      if (outcome?.sent === false) {
+        const detail = outcome.message ?? dashboardStrings.composerRetryRouteChanged;
+        const mayHaveWritten = outcome.textWritten || outcome.writeMayHaveOccurred;
+        setNote({ text: detail, error: !mayHaveWritten });
+        // Reuse the non-retryable receipt for possible input, even if Enter was refused.
+        setDashboardOptimisticMessageState(sessionId, messageId, mayHaveWritten ? "sent" : "failed", detail);
+        if (!mayHaveWritten && clearDraftAfterSend && !useComposerStore.getState().draftBySession[sessionId]) setDraft(sessionId, text);
+        return;
+      }
       const confirmed = outcome?.confirmed === true;
       const reason = outcome?.reason;
       setNote({
         text: confirmed
           ? dashboardStrings.sendConfirmedOnScreen
-          : unconfirmedSendText(reason),
+          : outcome?.message ?? unconfirmedSendText(reason),
         error: false,
       });
-      setDashboardOptimisticMessageState(sessionId, messageId, "sent");
+      setDashboardOptimisticMessageState(sessionId, messageId, "sent", confirmed ? null : outcome?.message ?? unconfirmedSendText(reason));
     } catch (error) {
       // handleSocketCommand が throw したときは書き込み自体が走っていない。
       const detail = `${dashboardStrings.sendFailedBeforeWrite} (${errorText(error)})`;
@@ -564,7 +616,7 @@ export function ReplyComposer({ card, inputRef, mentionTargets, questionActive =
         value={draft}
         disabled={blocked || sending}
         aria-label={dashboardStrings.composerAriaLabel}
-        placeholder={dashboardStrings.composerPlaceholder}
+        placeholder="メッセージ"
         onChange={(event) => onInputChange(event.target.value, event.target.selectionStart ?? event.target.value.length)}
         onKeyDown={onKeyDown}
         className="cmux-dashboard-composer-input"
@@ -572,10 +624,12 @@ export function ReplyComposer({ card, inputRef, mentionTargets, questionActive =
       <button
         type="button"
         disabled={!canSubmit}
+        aria-label="送信"
+        title="送信"
         className="cmux-dashboard-composer-send"
         style={{ opacity: canSubmit ? 1 : 0.55 }}
         onClick={() => void submit()}
-      >{dashboardStrings.composerSend}</button>
+      ><ArrowUp size={18} aria-hidden="true" /></button>
     </div>
     {menuOpen ? <div className="cmux-dashboard-mention-menu" role="listbox" aria-label={dashboardStrings.mentionMenuAriaLabel}>
       {menuCandidates.length ? menuCandidates.map((candidate, index) => <button
